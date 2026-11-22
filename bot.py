@@ -42,8 +42,10 @@ if MAX_BYTES <= 0 or MAX_FILES <= 0:
 JOBS = BASE / ".jobs"
 PARTS = BASE / ".incoming"
 ARCHIVES = BASE / ".archives"
-for folder in (BASE, JOBS, PARTS, ARCHIVES):
+SECRETS = BASE / ".secrets"
+for folder in (BASE, JOBS, PARTS, ARCHIVES, SECRETS):
     folder.mkdir(parents=True, exist_ok=True)
+SECRETS.chmod(0o700)
 
 # Fail fast if the same bot accidentally starts in two screen sessions.
 lockfile = (BASE / ".instance.lock").open("a+")
@@ -123,6 +125,29 @@ def queue_job(job):
     return True
 
 
+def password_file(job):
+    return SECRETS / (job["id"] + ".password")
+
+
+def set_password(job, password):
+    file = password_file(job)
+    tmp = file.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(password)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, file)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def get_password(job):
+    file = password_file(job)
+    return file.read_text(encoding="utf-8") if file.exists() else None
+
+
 def validate_entry(info):
     raw = info.filename.replace("\\", "/")
     path = PurePosixPath(raw)
@@ -140,7 +165,7 @@ def validate_entry(info):
     return path
 
 
-def extract_archive(source, destination):
+def extract_archive(source, destination, password=None):
     """Extract into disposable staging dir, only publish completed directories."""
     stage = BASE / (".extracting_" + destination.name)
     if destination.exists():
@@ -149,8 +174,10 @@ def extract_archive(source, destination):
     stage.mkdir()
     try:
         with rarfile.RarFile(str(source)) as archive:
-            if archive.needs_password():
-                raise ValueError("Encrypted RAR is unsupported")
+            if password is not None:
+                archive.setpassword(password)
+            elif archive.needs_password():
+                raise ValueError("PASSWORD_REQUIRED")
             entries = archive.infolist()
             if len(entries) > MAX_FILES:
                 raise ValueError("Too many archive entries")
@@ -310,8 +337,9 @@ async def process_job(job):
         job["state"] = "extracting"
         save_job(job)
         await send_notice(f"📂 Download finished. Extracting {job['name']}...", job)
-        count, size = await asyncio.to_thread(extract_archive, archive, output_path(job))
+        count, size = await asyncio.to_thread(extract_archive, archive, output_path(job), get_password(job))
         job["state"] = "done"
+        password_file(job).unlink(missing_ok=True)
         job["files"] = count
         job["extracted_bytes"] = size
         job["completed_at"] = int(time.time())
@@ -330,14 +358,22 @@ async def process_job(job):
         save_job(job)
         await send_notice(f"⏸ Paused {job['id']}. /resume to continue.", job)
     except Exception as exc:
-        log.exception("Job %s failed", job["id"])
+        log.error("Job %s failed (%s)", job["id"], type(exc).__name__)
         job["state"] = "failed"
-        job["error"] = str(exc)[:500]
+        error_text = str(exc)
+        if "PASSWORD_REQUIRED" in error_text or isinstance(exc, rarfile.PasswordRequired):
+            job["state"] = "awaiting_password"
+            job["error"] = "Password required"
+            guidance = f"🔐 Archive needs a password. Use /password {job['id']} YOUR_PASSWORD."
+        elif get_password(job) is not None and isinstance(exc, (rarfile.BadRarFile, rarfile.RarExecError)):
+            job["state"] = "awaiting_password"
+            job["error"] = "Decryption failed; check archive password"
+            guidance = f"🔐 Check the password. Use /password {job['id']} CORRECT_PASSWORD."
+        else:
+            job["error"] = error_text[:350]
+            guidance = f"❌ Failed {job['id']}: {job['error']}\nUse /retry {job['id']}."
         save_job(job)
-        await send_notice(
-            f"❌ Failed {job['id']}: {job['error']}\n"
-            f"Downloaded data was kept. Use /retry {job['id']}.", job
-        )
+        await send_notice(guidance + "\nDownloaded RAR kept on server.", job)
     finally:
         pause_requested.discard(job["id"])
 
@@ -389,6 +425,7 @@ HELP = (
     "/pause - pause current download\n"
     "/resume - continue paused/failed downloads\n"
     "/retry JOB_ID - requeue a specific failed job\n"
+    "/password JOB_ID PASSWORD - unlock encrypted RAR\n"
     "/help - this help\n\n"
     "Archives are only extracted; no database engine is modified."
 )
@@ -457,6 +494,37 @@ async def on_retry(_, message):
         await message.reply_text(f"Cannot retry a job in {job['state']} state")
         return
     await message.reply_text("✅ Queued for retry." if queue_job(job) else "Already queued.")
+
+
+@client.on_message(filters.private & filters.command("password"))
+async def on_password(_, message):
+    if not await authorized(message):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3:
+        await message.reply_text("Usage: /password JOB_ID PASSWORD. Use /list for job IDs.")
+        return
+    job = known_jobs.get(parts[1].lower())
+    if not job or job["state"] not in ("awaiting_password", "failed", "paused"):
+        await message.reply_text("Job not found or cannot accept a password. Use /list.")
+        return
+    if not parts[2] or len(parts[2]) > 512:
+        await message.reply_text("Password must be 1-512 characters.")
+        return
+    set_password(job, parts[2])
+    deleted = False
+    try:
+        await message.delete(revoke=True)
+        deleted = True
+    except Exception:
+        pass
+    await client.send_message(
+        OWNER_ID,
+        ("🔐 Password saved and extraction queued. " if deleted else
+         "🔐 Password saved. Please delete your password message manually. ")
+        + "Job: " + job["id"]
+    )
+    queue_job(job)
 
 
 @client.on_message(filters.private & filters.document)
