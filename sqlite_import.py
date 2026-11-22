@@ -116,6 +116,10 @@ def import_job(data_dir, job_id, progress=None):
         raise ValueError("No CSV files were found")
     with connect(database) as db:
         create_schema(db)
+        # Hide incomplete imports from lookup until the index is fully ready.
+        db.execute("INSERT INTO meta(key,value) VALUES('index_ready','0') "
+                   "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        db.commit()
         # Only build the index after import finishes; subsequent imports will
         # insert into an existing index incrementally.
         for file in paths:
