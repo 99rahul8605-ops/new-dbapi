@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 
 from rar_extract import extract_archive as extract_rar_unar, ArchivePasswordError, ArchiveExtractionError
 from csv_audit import audit_folder, write_audit, summary as audit_summary
-from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path
+from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path, pending_job as sqlite_pending_job
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
@@ -639,6 +639,13 @@ async def main():
     except Exception:
         log.exception("Startup message to OWNER_ID failed; verify OWNER_ID or start the bot in Telegram")
     worker_task = asyncio.create_task(worker())
+    # Resume a saved SQLite import interrupted by a reboot (no data replay).
+    try:
+        pending = await asyncio.to_thread(sqlite_pending_job, sqlite_db_path(BASE))
+        if pending and re.fullmatch(r"[0-9a-f]{12}", pending):
+            await start_import(pending)
+    except Exception:
+        log.exception("Could not recover pending SQLite import")
     # Recover interrupted transfers. Extraction can be rerun from completed .part.
     for job in sorted(known_jobs.values(), key=lambda j: j["created"]):
         if job["state"] in ("queued", "downloading", "extracting"):
