@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 
 from rar_extract import extract_archive as extract_rar_unar, ArchivePasswordError, ArchiveExtractionError
 from csv_audit import audit_folder, write_audit, summary as audit_summary
-from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path, pending_job as sqlite_pending_job, build_username_index, username_index_status, lookup_username
+from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path, pending_job as sqlite_pending_job, build_username_index, username_index_status, lookup_username, lookup_combined
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
@@ -381,7 +381,8 @@ HELP = (
     "/audit JOB_ID - recheck extracted CSV schema\n"
     "/import JOB_ID - import extracted CSVs into private SQLite\n"
     "/importstatus - live CSV/index progress, CPU, RAM and disk I/O\n"
-    "/lookup USER_ID [PAGE] - view full saved fields (owner only)\n"
+    "/lookup USER_ID - combine available fields from all matching rows\n"
+    "/records USER_ID [PAGE] - view original rows, 3 per page\n"
     "/usernameindex - build/resume username index after import\n"
     "/user USERNAME [PAGE] - private username lookup\n"
     "/status - current job, disk, queue\n"
@@ -613,7 +614,7 @@ async def username_lookup_private(message, raw_args):
         await message.reply_text(f"More: /user {pieces[0]} {page+1}")
 
 
-async def lookup_private(message, raw_args):
+async def lookup_raw_private(message, raw_args):
     parts = raw_args.split()
     if not parts:
         await message.reply_text("Usage: /lookup USER_ID [PAGE]")
@@ -647,6 +648,53 @@ async def lookup_private(message, raw_args):
             await message.reply_text(message_text[start:start+3500])
     if more:
         await message.reply_text(f"More matches: /lookup {number} {page+1}")
+
+
+async def lookup_private(message, raw_args):
+    parts = raw_args.split()
+    if not parts:
+        await message.reply_text("Usage: /lookup USER_ID")
+        return
+    uid = parts[0]
+    # Keep older numeric pagination working for callers who already use it.
+    if len(parts) > 1:
+        await lookup_raw_private(message, raw_args)
+        return
+    try:
+        summary = await asyncio.to_thread(lookup_combined, sqlite_db_path(BASE), uid)
+    except Exception as exc:
+        await message.reply_text(f"Lookup unavailable: {str(exc)[:250]}")
+        return
+    if not summary["matches"]:
+        await message.reply_text("No matching record for this User ID.")
+        return
+
+    lines = [
+        f"🔍 User ID: {uid}",
+        f"Records found: {summary['matches']:,}" +
+        (" (first 30,000 scanned)" if summary["truncated"] else ""),
+        f"Unique records: {summary['unique_rows']:,}",
+        f"Sources: {len(summary['sources'])}",
+    ]
+    lines.extend(f"• {name} ({count:,} records)"
+                 for name, count in summary["sources"].items())
+    lines.append("\n📋 Available information (unique non-empty values):")
+    for key, values in summary["fields"]:
+        lines.append(f"\n{key}:")
+        for value in values:
+            lines.append(f"  {value}")
+    if summary["truncated"]:
+        lines.append("\n⚠️ More than 30,000 matching rows; this summary covers the first 30,000.")
+    lines.append(f"\nRaw record pages: /records {uid} 1")
+    content = "\n".join(lines)
+    if len(content) > 30000:
+        attachment = io.BytesIO(content.encode("utf-8"))
+        attachment.name = f"uid_{uid}_combined.txt"
+        await client.send_document(OWNER_ID, attachment,
+                                   caption=f"All available unique fields for UID {uid}")
+    else:
+        for start in range(0, len(content), 3500):
+            await message.reply_text(content[start:start+3500])
 
 
 @client.on_message(filters.all)
@@ -716,6 +764,9 @@ async def message_router(_, message):
         elif command == "/lookup":
             args = (message.text or "").split(maxsplit=1)
             await lookup_private(message, args[1] if len(args) > 1 else "")
+        elif command == "/records":
+            args = (message.text or "").split(maxsplit=1)
+            await lookup_raw_private(message, args[1] if len(args) > 1 else "")
         elif command == "/usernameindex":
             if import_active or (import_task and not import_task.done()):
                 await message.reply_text("CSV import still running. Start username index after /importstatus shows INDEX READY.")
