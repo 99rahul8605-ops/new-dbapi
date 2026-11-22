@@ -99,3 +99,9 @@ The Python `rarfile` stream extractor was replaced by the same `unar` executable
 For an already-downloaded failed archive, keep `DATA_DIR` unchanged and use `/retry JOB_ID` after upgrading. If the job is waiting for a password, send `/password JOB_ID ACTUAL_PASSWORD` instead. No 3.5 GiB re-download should be required when the saved partial file is complete.
 
 **Password privacy caveat:** The `unar` and `lsar` CLI interfaces accept password options as command arguments. A sufficiently privileged local OS user may briefly see them in process listings; use a dedicated single-user VPS, restrict other accounts, and use passwords that are not reused elsewhere. The bot never prints the password to its own logs.
+
+## Automatic CSV audit after extraction
+
+After each successful RAR extraction the bot automatically samples up to 1,000 data rows per `.csv` file. It detects per-file delimiter (comma, semicolon, pipe, tab), maps candidate ID headers (`Telegram ID`, `User ID`, `User_ID`, `account_id`, `id`), counts numeric ID values, and reports inconsistent sampled row widths. Results go to `DATA_DIR/JOB_ID/_csv_audit.json`, containing aggregate counts and column metadata, **not personal data rows**. The bot sends a brief summary to the owner. Use `/audit JOB_ID` to rerun the same check on an already completed extraction; extraction and audit are separate, so audit failure does not invalidate extraction. This is a sampling step, not a full-file integrity scan or database import. No SQLite tables or per-user search indices are created by this feature.
+
+**Processing checklist for future phases:** archive reception → resumable download → safe extraction → automatic CSV format/schema audit → aggregate validation report → only after data authorization, design suitable data storage/import and optional indexing. Original archives and CSVs should not be overwritten as part of auditing.
