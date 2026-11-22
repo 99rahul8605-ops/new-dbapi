@@ -396,10 +396,14 @@ async def worker():
 
 
 async def authorized(message):
-    if message.chat and message.chat.type.value == "private" and message.from_user and message.from_user.id == OWNER_ID:
+    chat = getattr(message, "chat", None)
+    sender = getattr(message, "from_user", None)
+    chat_type = str(getattr(chat, "type", "")).lower()
+    is_private = "private" in chat_type
+    if is_private and sender and int(sender.id) == OWNER_ID:
         return True
-    if message.chat and message.chat.type.value == "private":
-        await message.reply_text("⛔ Access denied.")
+    if is_private:
+        await message.reply_text("⛔ Access denied. Check OWNER_ID in .env.")
     return False
 
 
@@ -420,6 +424,7 @@ HELP = (
     "📦 Smart Database RAR Bot\n\n"
     "Send a single .rar document in this private chat.\n"
     "Downloads resume after restart; RAR is safely extracted when finished.\n\n"
+    "/ping - test bot response\n"
     "/status - current job, disk, queue\n"
     "/list - recent uploads\n"
     "/pause - pause current download\n"
@@ -431,132 +436,120 @@ HELP = (
 )
 
 
-@client.on_message(filters.private & filters.command(["start", "help"]))
-async def on_help(_, message):
-    if await authorized(message):
-        await message.reply_text(HELP)
-
-
-@client.on_message(filters.private & filters.command("status"))
-async def on_status(_, message):
-    if not await authorized(message):
+@client.on_message(filters.all)
+async def message_router(_, message):
+    """Single robust handler for private messages; log delivery and failures."""
+    sender = getattr(message, "from_user", None)
+    user_id = sender.id if sender else None
+    chat = getattr(message, "chat", None)
+    chat_type = str(getattr(chat, "type", "")).lower()
+    if "private" not in chat_type:
         return
-    info = (
-        f"📊 Bot: online\nActive: {active_id or 'none'}\n"
-        f"Queue: {queue.qsize()}\nFree: {shutil.disk_usage(BASE).free / 1024**3:.2f} GiB\n"
-        f"Storage: {BASE}"
-    )
-    if active_id and active_id in known_jobs:
-        info += "\n\n" + job_status(known_jobs[active_id])
-    await message.reply_text(info)
-
-
-@client.on_message(filters.private & filters.command("list"))
-async def on_list(_, message):
-    if not await authorized(message):
-        return
-    jobs = sorted(known_jobs.values(), key=lambda j: j["created"], reverse=True)[:10]
-    await message.reply_text("\n\n".join(job_status(j) for j in jobs) if jobs else "No uploads yet.")
-
-
-@client.on_message(filters.private & filters.command("pause"))
-async def on_pause(_, message):
-    if not await authorized(message):
-        return
-    if not active_id or known_jobs[active_id]["state"] != "downloading":
-        await message.reply_text("No active download to pause.")
-        return
-    pause_requested.add(active_id)
-    await message.reply_text(f"⏸ Pausing {active_id} at next chunk boundary...")
-
-
-@client.on_message(filters.private & filters.command("resume"))
-async def on_resume(_, message):
-    if not await authorized(message):
-        return
-    count = 0
-    for job in sorted(known_jobs.values(), key=lambda j: j["created"]):
-        if job["state"] in ("paused", "failed"):
-            count += bool(queue_job(job))
-    await message.reply_text(f"Queued {count} paused/failed upload(s).")
-
-
-@client.on_message(filters.private & filters.command("retry"))
-async def on_retry(_, message):
-    if not await authorized(message):
-        return
-    job_id = message.command[1].lower() if len(message.command) > 1 else ""
-    job = known_jobs.get(job_id)
-    if not job:
-        await message.reply_text("Usage: /retry JOB_ID (see /list)")
-        return
-    if job["state"] not in ("paused", "failed"):
-        await message.reply_text(f"Cannot retry a job in {job['state']} state")
-        return
-    await message.reply_text("✅ Queued for retry." if queue_job(job) else "Already queued.")
-
-
-@client.on_message(filters.private & filters.command("password"))
-async def on_password(_, message):
-    if not await authorized(message):
-        return
-    parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 3:
-        await message.reply_text("Usage: /password JOB_ID PASSWORD. Use /list for job IDs.")
-        return
-    job = known_jobs.get(parts[1].lower())
-    if not job or job["state"] not in ("awaiting_password", "failed", "paused"):
-        await message.reply_text("Job not found or cannot accept a password. Use /list.")
-        return
-    if not parts[2] or len(parts[2]) > 512:
-        await message.reply_text("Password must be 1-512 characters.")
-        return
-    set_password(job, parts[2])
-    deleted = False
+    command = ((message.text or "").split(maxsplit=1)[0].split("@")[0].lower()
+               if message.text and message.text.startswith("/") else "")
+    # Do not log sensitive commands or their arguments.
+    log.info("Incoming private update from uid=%s command=%s document=%s",
+             user_id, command or "(none)", bool(message.document))
     try:
-        await message.delete(revoke=True)
-        deleted = True
+        if not await authorized(message):
+            return
+        if command in ("/start", "/help"):
+            await message.reply_text(HELP)
+        elif command == "/ping":
+            await message.reply_text("🏓 Pong! Bot is online and receiving messages.")
+        elif command == "/status":
+            info = (
+                f"📊 Bot online\nActive: {active_id or 'none'}\n"
+                f"Queue: {queue.qsize()}\nFree: {shutil.disk_usage(BASE).free / 1024**3:.2f} GiB\n"
+                f"Storage: {BASE}"
+            )
+            if active_id and active_id in known_jobs:
+                info += "\n\n" + job_status(known_jobs[active_id])
+            await message.reply_text(info)
+        elif command == "/list":
+            jobs = sorted(known_jobs.values(), key=lambda j: j["created"], reverse=True)[:10]
+            await message.reply_text("\n\n".join(job_status(j) for j in jobs)
+                                     if jobs else "No uploads yet.")
+        elif command == "/pause":
+            if not active_id or known_jobs[active_id]["state"] != "downloading":
+                await message.reply_text("No active download to pause.")
+            else:
+                pause_requested.add(active_id)
+                await message.reply_text(f"⏸ Pausing {active_id} at next chunk boundary.")
+        elif command == "/resume":
+            count = 0
+            for job in sorted(known_jobs.values(), key=lambda j: j["created"]):
+                if job["state"] in ("paused", "failed"):
+                    count += bool(queue_job(job))
+            await message.reply_text(f"Queued {count} paused/failed job(s).")
+        elif command == "/retry":
+            args = (message.text or "").split(maxsplit=1)
+            jid = args[1].lower().strip() if len(args) > 1 else ""
+            job = known_jobs.get(jid)
+            if not job:
+                await message.reply_text("Usage: /retry JOB_ID (see /list)")
+            elif job["state"] not in ("paused", "failed", "awaiting_password"):
+                await message.reply_text("Cannot retry job in state " + job["state"])
+            else:
+                await message.reply_text("✅ Queued." if queue_job(job) else "Already queued.")
+        elif command == "/password":
+            parts = (message.text or "").split(maxsplit=2)
+            if len(parts) < 3:
+                await message.reply_text("Usage: /password JOB_ID PASSWORD")
+                return
+            job = known_jobs.get(parts[1].lower())
+            if not job or job["state"] not in ("awaiting_password", "failed", "paused"):
+                await message.reply_text("Job not found or not waiting for password; see /list.")
+                return
+            if not parts[2] or len(parts[2]) > 512:
+                await message.reply_text("Password must contain 1–512 characters.")
+                return
+            set_password(job, parts[2])
+            deleted = False
+            try:
+                await message.delete(revoke=True)
+                deleted = True
+            except Exception:
+                log.warning("Could not delete password message; user should delete it.")
+            await client.send_message(
+                OWNER_ID,
+                f"🔐 Password stored and extraction queued: {job['id']}."
+                + ("" if deleted else " Delete your password message manually.")
+            )
+            queue_job(job)
+        elif message.document:
+            document = message.document
+            filename = document.file_name or ""
+            if not filename.lower().endswith(".rar"):
+                await message.reply_text("Send a .rar archive as a Telegram document.")
+                return
+            if not document.file_size:
+                await message.reply_text("Telegram didn't report document size.")
+                return
+            if any(j["message_id"] == message.id for j in known_jobs.values()):
+                await message.reply_text("This message is already queued.")
+                return
+            job = {
+                "id": uuid.uuid4().hex[:12],
+                "name": safe_name(filename) if safe_name(filename).lower().endswith(".rar")
+                        else safe_name(filename) + ".rar",
+                "message_id": message.id,
+                "size": document.file_size,
+                "state": "queued",
+                "created": int(time.time())
+            }
+            save_job(job)
+            queue_job(job)
+            await message.reply_text(
+                f"✅ File queued: {job['name']}\nID: {job['id']}\n"
+                f"Size: {bytes_human(job['size'])}\nResumable download enabled."
+            )
     except Exception:
-        pass
-    await client.send_message(
-        OWNER_ID,
-        ("🔐 Password saved and extraction queued. " if deleted else
-         "🔐 Password saved. Please delete your password message manually. ")
-        + "Job: " + job["id"]
-    )
-    queue_job(job)
-
-
-@client.on_message(filters.private & filters.document)
-async def on_file(_, message):
-    if not await authorized(message):
-        return
-    document = message.document
-    filename = document.file_name or ""
-    if not filename.lower().endswith(".rar"):
-        await message.reply_text("Send a single .rar archive as a Telegram document.")
-        return
-    if not document.file_size:
-        await message.reply_text("Telegram didn't report the document size.")
-        return
-    if any(j["message_id"] == message.id for j in known_jobs.values()):
-        await message.reply_text("Already accepted this Telegram message.")
-        return
-    job = {
-        "id": uuid.uuid4().hex[:12],
-        "name": safe_name(filename) if safe_name(filename).lower().endswith(".rar") else safe_name(filename) + ".rar",
-        "message_id": message.id,
-        "size": document.file_size,
-        "state": "queued",
-        "created": int(time.time()),
-    }
-    save_job(job)
-    queue_job(job)
-    await message.reply_text(
-        f"✅ File queued: {job['name']}\nID: {job['id']}\n"
-        f"Size: {bytes_human(job['size'])}\n"
-        "Safe resumable download enabled."
-    )
+        log.exception("Message handler failed; uid=%s command=%s", user_id, command)
+        try:
+            await message.reply_text("❌ Handler error. Check server console logs.")
+        except Exception:
+            log.exception("Could not send handler error to Telegram")
 
 
 async def main():
@@ -564,7 +557,12 @@ async def main():
     load_jobs()
     await client.start()
     me = await client.get_me()
-    log.info("Started @%s; %s storage; %d saved jobs", me.username, BASE, len(known_jobs))
+    log.info("Started @%s; %s storage; %d saved jobs; OWNER_ID=%s", me.username, BASE, len(known_jobs), OWNER_ID)
+    try:
+        await client.send_message(OWNER_ID, "✅ Database bot started. Send /ping to test responses.")
+        log.info("Startup test message sent to OWNER_ID")
+    except Exception:
+        log.exception("Startup message to OWNER_ID failed; verify OWNER_ID or start the bot in Telegram")
     worker_task = asyncio.create_task(worker())
     # Recover interrupted transfers. Extraction can be rerun from completed .part.
     for job in sorted(known_jobs.values(), key=lambda j: j["created"]):
