@@ -678,11 +678,24 @@ async def lookup_private(message, raw_args):
     ]
     lines.extend(f"• {name} ({count:,} records)"
                  for name, count in summary["sources"].items())
-    lines.append("\n📋 Available information (unique non-empty values):")
+    lines.append("\n📋 Validated / labeled information:")
     for key, values in summary["fields"]:
-        lines.append(f"\n{key}:")
-        for value in values:
-            lines.append(f"  {value}")
+        if key == "Other labeled fields":
+            lines.append("\nOther fields (from aligned CSV records):")
+            for value, header in values:
+                lines.append(f"  {header}: {value}")
+        else:
+            lines.append(f"\n{key}:")
+            for value in values:
+                lines.append(f"  {value}")
+    if not summary["fields"]:
+        lines.append("No reliably labeled values found. Inspect raw records.")
+    if summary["mismatched"] or summary["unverified_count"]:
+        lines.append(
+            f"\n⚠️ {summary['mismatched']:,} unique records have column-count mismatches; "
+            "their ambiguous values were not assigned guessed field names."
+        )
+        lines.append("Some values cannot be mapped reliably from the imported CSV.")
     if summary["truncated"]:
         lines.append("\n⚠️ More than 30,000 matching rows; this summary covers the first 30,000.")
     lines.append(f"\nRaw record pages: /records {uid} 1")
