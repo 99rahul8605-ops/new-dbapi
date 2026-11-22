@@ -124,6 +124,10 @@ def import_job(data_dir, job_id, progress=None):
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (job_id,)
         )
         db.commit()
+        # Any new records invalidate username index readiness until rebuilt.
+        db.execute("INSERT INTO meta(key,value) VALUES('username_index_ready','0') "
+                   "ON CONFLICT(key) DO UPDATE SET value='0'")
+        db.commit()
         # Hide incomplete imports from lookup until the index is fully ready.
         db.execute("INSERT INTO meta(key,value) VALUES('index_ready','0') "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
