@@ -16,7 +16,7 @@ from pathlib import Path, PurePosixPath
 
 from rar_extract import extract_archive as extract_rar_unar, ArchivePasswordError, ArchiveExtractionError
 from csv_audit import audit_folder, write_audit, summary as audit_summary
-from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path, pending_job as sqlite_pending_job
+from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path, pending_job as sqlite_pending_job, build_username_index, username_index_status, lookup_username
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
@@ -76,6 +76,7 @@ known_jobs = {}
 import_task = None
 import_active = None
 import_requested = set()
+username_task = None
 
 
 def safe_name(value):
@@ -381,6 +382,8 @@ HELP = (
     "/import JOB_ID - import extracted CSVs into private SQLite\n"
     "/importstatus - SQLite progress and index readiness\n"
     "/lookup USER_ID [PAGE] - view full saved fields (owner only)\n"
+    "/usernameindex - build/resume username index after import\n"
+    "/user USERNAME [PAGE] - private username lookup\n"
     "/status - current job, disk, queue\n"
     "/list - recent uploads\n"
     "/pause - pause current download\n"
@@ -431,6 +434,51 @@ async def start_import(job_id):
     return True
 
 
+async def username_index_worker():
+    try:
+        await client.send_message(OWNER_ID, "🔎 Username index building from existing SQLite. Use /indexstatus.")
+        def progress(cursor):
+            log.info("Username index scan rowid=%s", cursor)
+        result = await asyncio.to_thread(build_username_index, sqlite_db_path(BASE), progress)
+        await client.send_message(OWNER_ID, f"✅ Username index ready! Entries: {result['entries']:,}. Use /user @username")
+    except Exception as exc:
+        log.exception("Username index failed")
+        await client.send_message(
+            OWNER_ID,
+            f"❌ Username index interrupted: {type(exc).__name__}: {str(exc)[:200]}. "
+            "Use /usernameindex to resume."
+        )
+
+
+async def username_lookup_private(message, raw_args):
+    pieces = raw_args.split()
+    if not pieces:
+        await message.reply_text("Usage: /user @username [PAGE]")
+        return
+    try:
+        page = int(pieces[1]) if len(pieces)>1 else 1
+        result, more = await asyncio.to_thread(lookup_username, sqlite_db_path(BASE), pieces[0], page)
+    except Exception as exc:
+        await message.reply_text("Username search unavailable: " + str(exc)[:250])
+        return
+    if not result:
+        await message.reply_text("No matching username found.")
+        return
+    for i, (filename, uid, pairs) in enumerate(result,1):
+        lines=[f"🔎 Username: {pieces[0]}",f"User ID: {uid}",f"Source: {filename}",f"Page: {page} · Match {i}"]
+        lines += [f"{key}: {value}" for key,value in pairs]
+        value="\n".join(lines)
+        if len(value)>30000:
+            attachment=io.BytesIO(value.encode("utf-8"))
+            attachment.name=f"username_record_{page}_{i}.txt"
+            await client.send_document(OWNER_ID,attachment,caption="Full username record")
+        else:
+            for at in range(0,len(value),3500):
+                await message.reply_text(value[at:at+3500])
+    if more:
+        await message.reply_text(f"More: /user {pieces[0]} {page+1}")
+
+
 async def lookup_private(message, raw_args):
     parts = raw_args.split()
     if not parts:
@@ -470,6 +518,7 @@ async def lookup_private(message, raw_args):
 @client.on_message(filters.all)
 async def message_router(_, message):
     """Single robust handler for private messages; log delivery and failures."""
+    global username_task
     sender = getattr(message, "from_user", None)
     user_id = sender.id if sender else None
     chat = getattr(message, "chat", None)
@@ -548,6 +597,29 @@ async def message_router(_, message):
         elif command == "/lookup":
             args = (message.text or "").split(maxsplit=1)
             await lookup_private(message, args[1] if len(args) > 1 else "")
+        elif command == "/usernameindex":
+            if import_active or (import_task and not import_task.done()):
+                await message.reply_text("CSV import still running. Start username index after /importstatus shows INDEX READY.")
+                return
+            if username_task and not username_task.done():
+                await message.reply_text("Username index is already building.")
+                return
+            import_info = await asyncio.to_thread(sqlite_status, sqlite_db_path(BASE))
+            if not import_info.get("indexed"):
+                await message.reply_text("Finish SQLite import and User ID index first.")
+                return
+            username_task = asyncio.create_task(username_index_worker())
+            await message.reply_text("✅ Username index job started. Use /indexstatus.")
+        elif command == "/indexstatus":
+            info = await asyncio.to_thread(username_index_status, sqlite_db_path(BASE))
+            await message.reply_text(
+                f"Username index: {'READY' if info['ready'] else 'NOT READY / BUILDING'}\n"
+                f"Indexed usernames: {info['entries']:,}\n"
+                f"Scanned through record rowid: {info['cursor']:,}"
+            )
+        elif command == "/user":
+            args = (message.text or "").split(maxsplit=1)
+            await username_lookup_private(message, args[1] if len(args)>1 else "")
         elif command == "/pause":
             if not active_id or known_jobs[active_id]["state"] != "downloading":
                 await message.reply_text("No active download to pause.")
