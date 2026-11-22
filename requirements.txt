@@ -2,3 +2,4 @@ pyrofork>=2.3,<3
 tgcrypto-pyrofork>=1.2,<2
 rarfile>=4.2,<5
 python-dotenv>=1.0,<2
+cryptography>=42,<47
