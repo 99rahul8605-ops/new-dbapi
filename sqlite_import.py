@@ -106,8 +106,11 @@ def status(path):
 def import_job(data_dir, job_id, progress=None):
     root = Path(data_dir).resolve()
     source_root = (root / job_id).resolve()
-    if not source_root.is_dir() or source_root.parent != root:
-        raise ValueError("No extracted job folder found in DATA_DIR")
+    if not source_root.is_dir():
+        # Support historical archives extracted manually in the repo working dir.
+        source_root = (root.parent / job_id).resolve()
+    if not source_root.is_dir() or source_root.parent not in (root, root.parent):
+        raise ValueError("No extracted job folder found in DATA_DIR or its parent")
     database = db_path(root)
     database.parent.mkdir(mode=0o700, exist_ok=True)
     os.chmod(database.parent, 0o700)
