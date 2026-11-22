@@ -1,56 +1,77 @@
-# Telegram Database RAR Upload Bot
+# Smart Telegram RAR database uploader
 
-Owner-only Telegram bot that downloads RAR archives directly to your server using Telegram MTProto, validates archive contents, and safely extracts them into a persistent folder.
+An owner-only Telegram bot that downloads database archives to persistent storage using **512 KiB Telegram chunks**, safely resumes after disconnect/restart, and extracts the RAR without modifying any existing database.
 
-**Phase 1 only:** Save and extract files. It does not automatically import SQLite, SQL dumps, MongoDB exports, or other formats into a running database.
+## Features
 
-## Requirements
+- **Resume after reboot**: saves original Telegram message ID, expected file length, state and partial `.part` file under `DATA_DIR`. Restart continues from the last complete chunk, not 0%.
+- Automatic retry (exponential backoff); stalled/failed jobs kept on disk for manual retry.
+- Sequential queue so multiple incoming RAR files don't download simultaneously; queued jobs survive restart.
+- Telegram progress message displays percentage, downloaded MiB, current MiB/s and ETA. Telegram edits are throttled to avoid flood limits.
+- Owner-only private chat. One instance per storage folder. `/pause`, `/resume`, `/retry`, `/status`, `/list`.
+- Safe extraction into a staging directory; path traversal and special file entries rejected, with file-count/size and free-space limits.
+- On successful extraction removes the downloaded archive unless `KEEP_RAR=true`. Failed extraction **retains** the archive for retry.
 
-- Linux VPS with persistent disk space
-- Python 3.10+
-- Telegram bot token (@BotFather)
-- Telegram API_ID / API_HASH from https://my.telegram.org
-- Your numeric Telegram user ID
-- A RAR extractor backend, e.g. `unar` or `unrar`
+### Limitations
 
-## Install on Ubuntu/Debian
+Only **single-volume, unencrypted .rar documents**. No password RAR or multipart RAR support. A Telegram message deleted by its sender or unavailable to the bot cannot be resumed. Upload progress from your phone to Telegram is controlled by Telegram; this bot tracks **Telegram-to-VPS downloads**. The server must have stable persistent storage. Telegram/network may limit transfer speeds; Cython `cryptg` speeds up cryptography but does not guarantee download speed. Extraction size is constrained by available disk and `MAX_EXTRACT_GB`. Resumption uses complete 512 KiB offsets and may re-fetch up to one partial chunk. It does not verify a cryptographic hash of the entire original Telegram archive.
+
+This is **storage/extraction only**: it does not import SQL files, MongoDB dumps, or SQLite data into a database service.
+
+## Deploy on Ubuntu / Debian VPS
 
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv unar
+apt update
+apt install -y python3 python3-venv git unar screen
+# Existing clone: cd ~/new-dbapi && git pull origin main
+# First install only:
 git clone https://github.com/99rahul8605-ops/new-dbapi.git
 cd new-dbapi
 python3 -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
 nano .env
-python bot.py
+chmod 600 .env
 ```
 
-Fill in `BOT_TOKEN`, `API_ID`, `API_HASH`, and `OWNER_ID` in `.env` first. Configure `DATA_DIR` with an absolute path on a persistent volume (e.g. `/root/db-storage`). Protect .env with `chmod 600 .env`.
+Fill `BOT_TOKEN`, `API_ID`, `API_HASH`, `OWNER_ID`, `DATA_DIR` in `.env`. Choose an **absolute**, persistent DATA_DIR; keep it unchanged on upgrades (e.g. `/root/db-storage`).
 
-For a persistent systemd service, run `python bot.py` under a service manager with `Restart=always` and the working directory set to this repo. Do not run multiple bot instances using the same session file.
+```bash
+screen -dmS db bash -lc 'cd ~/new-dbapi && exec .venv/bin/python -u bot.py >> bot.log 2>&1'
+screen -ls
+tail -f ~/new-dbapi/bot.log
+```
 
-## Telegram commands
+If the bot already runs in the `db` screen, stop it *before* restarting with new code:
 
-- `/start` / `/help`: instructions
-- `/status`: busy/idle and free disk
-- `/list`: latest 15 extracted uploads
-- Send one **.rar document** in the bot's private chat to start an upload
+```bash
+cd ~/new-dbapi
+screen -S db -X quit
+sleep 2
+git pull origin main
+source .venv/bin/activate
+pip install -r requirements.txt
+screen -dmS db bash -lc 'cd ~/new-dbapi && exec .venv/bin/python -u bot.py >> bot.log 2>&1'
+screen -ls
+tail -n 30 bot.log
+```
 
-Each upload is stored in a unique folder inside `DATA_DIR`, such as `database_uploads/20261122_150000_ab12cd34_backup/`. Uploads run one at a time. On successful extraction the downloaded RAR is removed unless `KEEP_RAR=true`.
+**Important migration note:** Downloads begun with the **old version** did not have saved Telegram message metadata; the new code cannot reliably resume them. Downloads received by the **new version** will resume after subsequent restarts. An interrupted extraction may need retry; the original RAR is retained until success.
 
-## Limits and safety
+## Bot commands
 
-- Sender must be the configured owner in a private chat.
-- Rejects archive traversal paths, symlinks/special entries, duplicates, too many entries, and archives exceeding `MAX_EXTRACT_GB` of declared or actual uncompressed data.
-- Verifies available disk space before extraction and cleans failed extractions.
-- Password-protected RARs and multipart RAR sets are **not supported** in this version.
-- Large Telegram files are received over MTProto. Actual upload limits depend on Telegram, local disk, and connectivity.
-- Untrusted archive extraction is never risk-free; prefer running this bot as a dedicated restricted Linux user and use a storage volume with no execute permission.
-- Extracted folders remain on the server until you manually delete them. No database is replaced or modified by this bot.
+| Command | Meaning |
+|---|---|
+| `/start`, `/help` | Help |
+| `/status` | Active transfer, queue, free disk |
+| `/list` | Last 10 jobs, IDs and states |
+| `/pause` | Pause active download after next chunk |
+| `/resume` | Requeue all paused/failed jobs |
+| `/retry JOB_ID` | Retry one paused/failed job from saved bytes |
 
-## Future phase
+Send a .rar document as a private Telegram message to the bot. Incoming documents queue automatically. No public upload endpoint is exposed.
 
-Once the RAR contents and database engine are known, you can add validated import/restore commands with confirmation and backups.
+## Security
+
+Run as a restricted Linux user, ideally with disk quotas and filesystem protections. Archive content is not executed. Do not put `.env`, Telegram session files, or `DATA_DIR` into Git. The bot is intentionally not a remote shell; users cannot provide arbitrary filesystem paths or commands. If source data is untrusted, use OS-level sandboxing as an additional defense. Verify free disk space before very large transfers.
