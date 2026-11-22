@@ -1,6 +1,6 @@
 # Smart Telegram RAR database uploader
 
-An owner-only Telegram bot that downloads database archives to persistent storage using **512 KiB Telegram chunks**, safely resumes after disconnect/restart, and extracts the RAR without modifying any existing database.
+An owner-only Telegram bot that downloads database archives to persistent storage using **1 MiB Pyrofork stream chunks**, safely resumes after disconnect/restart, and extracts the RAR without modifying any existing database.
 
 ## Features
 
@@ -14,7 +14,7 @@ An owner-only Telegram bot that downloads database archives to persistent storag
 
 ### Limitations
 
-Only **single-volume, unencrypted .rar documents**. No password RAR or multipart RAR support. A Telegram message deleted by its sender or unavailable to the bot cannot be resumed. Upload progress from your phone to Telegram is controlled by Telegram; this bot tracks **Telegram-to-VPS downloads**. The server must have stable persistent storage. Telegram/network may limit transfer speeds; Cython `cryptg` speeds up cryptography but does not guarantee download speed. Extraction size is constrained by available disk and `MAX_EXTRACT_GB`. Resumption uses complete 512 KiB offsets and may re-fetch up to one partial chunk. It does not verify a cryptographic hash of the entire original Telegram archive.
+Only **single-volume, unencrypted .rar documents**. No password RAR or multipart RAR support. A Telegram message deleted by its sender or unavailable to the bot cannot be resumed. Upload progress from your phone to Telegram is controlled by Telegram; this bot tracks **Telegram-to-VPS downloads**. The server must have stable persistent storage. Telegram/network may limit transfer speeds; `tgcrypto-pyrofork` speeds up cryptography but does not guarantee download speed. Extraction size is constrained by available disk and `MAX_EXTRACT_GB`. Resumption uses complete 1 MiB offsets and may re-fetch up to one partial chunk. It does not verify a cryptographic hash of the entire original Telegram archive.
 
 This is **storage/extraction only**: it does not import SQL files, MongoDB dumps, or SQLite data into a database service.
 
@@ -51,13 +51,14 @@ screen -S db -X quit
 sleep 2
 git pull origin main
 source .venv/bin/activate
+pip uninstall -y pyrogram telethon cryptg tgcrypto 2>/dev/null || true
 pip install -r requirements.txt
 screen -dmS db bash -lc 'cd ~/new-dbapi && exec .venv/bin/python -u bot.py >> bot.log 2>&1'
 screen -ls
 tail -n 30 bot.log
 ```
 
-**Important migration note:** Downloads begun with the **old version** did not have saved Telegram message metadata; the new code cannot reliably resume them. Downloads received by the **new version** will resume after subsequent restarts. An interrupted extraction may need retry; the original RAR is retained until success.
+**Important migration note:** Downloads begun with the **first single-file download version** did not have saved Telegram message metadata; the new code cannot reliably resume them. Downloads received by the **new version** will resume after subsequent restarts. An interrupted extraction may need retry; the original RAR is retained until success.
 
 ## Bot commands
 
@@ -75,3 +76,11 @@ Send a .rar document as a private Telegram message to the bot. Incoming document
 ## Security
 
 Run as a restricted Linux user, ideally with disk quotas and filesystem protections. Archive content is not executed. Do not put `.env`, Telegram session files, or `DATA_DIR` into Git. The bot is intentionally not a remote shell; users cannot provide arbitrary filesystem paths or commands. If source data is untrusted, use OS-level sandboxing as an additional defense. Verify free disk space before very large transfers.
+
+## Pyrofork migration (November 2026)
+
+The bot uses **Pyrofork** (a Pyrogram-compatible maintained fork) and **TgCrypto-pyrofork**. It imports from `pyrogram` but the installed PyPI distribution is `pyrofork`. Python session state is stored in `upload_bot_pyrofork_session.session` rather than the old Telethon session. The `DATA_DIR/.jobs/*.json` and `DATA_DIR/.incoming/*.part` formats stay compatible with the previous resumable Telethon release. On the first Pyrofork startup, the .part files are rounded back to a full 1 MiB boundary, so at most the last partial MiB is re-downloaded. Do **not** delete DATA_DIR or change it when migrating.
+
+Wait for a currently running download to finish before stopping the previous screen session. Pull and install from the README's restart instructions afterward. To verify installed backend: `python -c 'import pyrogram; print(pyrogram.__version__)'`. The migration has not been live-tested on your VPS yet; watch `bot.log` after first start.
+
+**Safety:** Pyrofork's high-level `download_media` has had a path-traversal advisory. This project does **not** use that high-level file writer: it streams bytes directly into an internally generated filename, without trusting Telegram-provided paths.
