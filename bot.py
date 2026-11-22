@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 
 import rarfile
 from dotenv import load_dotenv
-from telethon import TelegramClient, events
+from pyrogram import Client, filters, idle
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
@@ -31,7 +31,7 @@ MAX_FILES = int(os.getenv("MAX_FILES", "100000"))
 MAX_BYTES = int(MAX_GB * 1024 ** 3)
 KEEP_RAR = os.getenv("KEEP_RAR", "false").lower() == "true"
 RETRIES = max(1, min(10, int(os.getenv("DOWNLOAD_RETRIES", "5"))))
-CHUNK = 512 * 1024  # Aligned Telegram GetFile requests, safe for resume.
+CHUNK = 1024 * 1024  # Pyrofork stream_media uses 1 MiB chunk offsets.
 UPDATE_SECONDS = 8
 
 if not all((BOT_TOKEN, API_ID, API_HASH, OWNER_ID)):
@@ -52,7 +52,7 @@ try:
 except BlockingIOError:
     raise SystemExit("Another uploader already uses this DATA_DIR")
 
-client = TelegramClient("upload_bot_session", API_ID, API_HASH)
+client = Client("upload_bot_pyrofork_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=8)
 queue = asyncio.Queue()
 queued_ids = set()
 active_id = None
@@ -201,7 +201,7 @@ def extract_archive(source, destination):
 async def send_notice(text, job=None):
     try:
         if job and job.get("progress_msg"):
-            await client.edit_message(OWNER_ID, job["progress_msg"], text)
+            await client.edit_message_text(OWNER_ID, job["progress_msg"], text)
         else:
             msg = await client.send_message(OWNER_ID, text)
             if job:
@@ -235,8 +235,8 @@ async def transfer(job):
             raise InterruptedError("Paused by owner")
         try:
             # Refresh the Telegram file reference after reconnect or restart.
-            msg = await client.get_messages(OWNER_ID, ids=int(job["message_id"]))
-            if not msg or not msg.file or msg.file.size != expected:
+            msg = await client.get_messages(OWNER_ID, int(job["message_id"]))
+            if not msg or getattr(msg, "empty", False) or not msg.document or msg.document.file_size != expected:
                 raise RuntimeError("Original Telegram message missing/changed")
             offset = path.stat().st_size if path.exists() else 0
             if offset > expected:
@@ -253,9 +253,7 @@ async def transfer(job):
             last_sample = started
             last_bytes = offset
             with path.open("ab") as fh:
-                async for chunk in client.iter_download(
-                    msg.media, offset=offset, request_size=CHUNK, chunk_size=CHUNK
-                ):
+                async for chunk in client.stream_media(msg, offset=offset // CHUNK):
                     if job["id"] in pause_requested:
                         raise InterruptedError("Paused by owner")
                     if not chunk:
@@ -277,7 +275,8 @@ async def transfer(job):
                             f"ID: {job['id']}\n"
                             f"{offset * 100 / expected:.1f}% · {bytes_human(offset)} / {bytes_human(expected)}\n"
                             f"Speed: {rate / 1024**2:.2f} MiB/s · "
-                            f"ETA: {eta // 60}m {eta % 60}s" if eta is not None else "ETA: calculating"
+                            f"ETA: {eta // 60}m {eta % 60}s" if eta is not None else
+                            f"⬇️ Downloading {job['name']} · ETA: calculating"
                         )
                         # Notice failures must not break a file transfer.
                         await send_notice(progress, job)
@@ -360,11 +359,11 @@ async def worker():
             queue.task_done()
 
 
-async def authorized(event):
-    if event.is_private and event.sender_id == OWNER_ID:
+async def authorized(message):
+    if message.chat and message.chat.type.value == "private" and message.from_user and message.from_user.id == OWNER_ID:
         return True
-    if event.is_private:
-        await event.reply("⛔ Access denied.")
+    if message.chat and message.chat.type.value == "private":
+        await message.reply_text("⛔ Access denied.")
     return False
 
 
@@ -395,97 +394,97 @@ HELP = (
 )
 
 
-@client.on(events.NewMessage(pattern=r"^/(start|help)(?:@\w+)?$", incoming=True))
-async def on_help(event):
-    if await authorized(event):
-        await event.reply(HELP)
+@client.on_message(filters.private & filters.command(["start", "help"]))
+async def on_help(_, message):
+    if await authorized(message):
+        await message.reply_text(HELP)
 
 
-@client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$", incoming=True))
-async def on_status(event):
-    if not await authorized(event):
+@client.on_message(filters.private & filters.command("status"))
+async def on_status(_, message):
+    if not await authorized(message):
         return
-    text = (
+    info = (
         f"📊 Bot: online\nActive: {active_id or 'none'}\n"
         f"Queue: {queue.qsize()}\nFree: {shutil.disk_usage(BASE).free / 1024**3:.2f} GiB\n"
         f"Storage: {BASE}"
     )
     if active_id and active_id in known_jobs:
-        text += "\n\n" + job_status(known_jobs[active_id])
-    await event.reply(text)
+        info += "\n\n" + job_status(known_jobs[active_id])
+    await message.reply_text(info)
 
 
-@client.on(events.NewMessage(pattern=r"^/list(?:@\w+)?$", incoming=True))
-async def on_list(event):
-    if not await authorized(event):
+@client.on_message(filters.private & filters.command("list"))
+async def on_list(_, message):
+    if not await authorized(message):
         return
     jobs = sorted(known_jobs.values(), key=lambda j: j["created"], reverse=True)[:10]
-    await event.reply("\n\n".join(job_status(j) for j in jobs) if jobs else "No uploads yet.")
+    await message.reply_text("\n\n".join(job_status(j) for j in jobs) if jobs else "No uploads yet.")
 
 
-@client.on(events.NewMessage(pattern=r"^/pause(?:@\w+)?$", incoming=True))
-async def on_pause(event):
-    if not await authorized(event):
+@client.on_message(filters.private & filters.command("pause"))
+async def on_pause(_, message):
+    if not await authorized(message):
         return
     if not active_id or known_jobs[active_id]["state"] != "downloading":
-        await event.reply("No active download to pause.")
+        await message.reply_text("No active download to pause.")
         return
     pause_requested.add(active_id)
-    await event.reply(f"⏸ Pausing {active_id} at next chunk boundary...")
+    await message.reply_text(f"⏸ Pausing {active_id} at next chunk boundary...")
 
 
-@client.on(events.NewMessage(pattern=r"^/resume(?:@\w+)?$", incoming=True))
-async def on_resume(event):
-    if not await authorized(event):
+@client.on_message(filters.private & filters.command("resume"))
+async def on_resume(_, message):
+    if not await authorized(message):
         return
     count = 0
     for job in sorted(known_jobs.values(), key=lambda j: j["created"]):
         if job["state"] in ("paused", "failed"):
             count += bool(queue_job(job))
-    await event.reply(f"Queued {count} paused/failed upload(s).")
+    await message.reply_text(f"Queued {count} paused/failed upload(s).")
 
 
-@client.on(events.NewMessage(pattern=r"^/retry(?:@\w+)?(?:\s+([0-9a-f]{12}))?$", incoming=True))
-async def on_retry(event):
-    if not await authorized(event):
+@client.on_message(filters.private & filters.command("retry"))
+async def on_retry(_, message):
+    if not await authorized(message):
         return
-    job_id = event.pattern_match.group(1)
-    job = known_jobs.get(job_id) if job_id else None
+    job_id = message.command[1].lower() if len(message.command) > 1 else ""
+    job = known_jobs.get(job_id)
     if not job:
-        await event.reply("Usage: /retry JOB_ID (see /list)")
+        await message.reply_text("Usage: /retry JOB_ID (see /list)")
         return
     if job["state"] not in ("paused", "failed"):
-        await event.reply(f"Cannot retry a job in {job['state']} state")
+        await message.reply_text(f"Cannot retry a job in {job['state']} state")
         return
-    await event.reply("✅ Queued for retry." if queue_job(job) else "Already queued.")
+    await message.reply_text("✅ Queued for retry." if queue_job(job) else "Already queued.")
 
 
-@client.on(events.NewMessage(func=lambda e: e.is_private and bool(e.message.file), incoming=True))
-async def on_file(event):
-    if not await authorized(event):
+@client.on_message(filters.private & filters.document)
+async def on_file(_, message):
+    if not await authorized(message):
         return
-    filename = event.file.name or ""
+    document = message.document
+    filename = document.file_name or ""
     if not filename.lower().endswith(".rar"):
-        await event.reply("Send a single .rar archive as a Telegram document.")
+        await message.reply_text("Send a single .rar archive as a Telegram document.")
         return
-    if not event.file.size:
-        await event.reply("Telegram didn't report the document size.")
+    if not document.file_size:
+        await message.reply_text("Telegram didn't report the document size.")
         return
-    # Ignore accidental duplicate handling of the same Telegram message.
-    if any(j["message_id"] == event.id for j in known_jobs.values()):
-        await event.reply("Already accepted this Telegram message.")
+    if any(j["message_id"] == message.id for j in known_jobs.values()):
+        await message.reply_text("Already accepted this Telegram message.")
         return
     job = {
         "id": uuid.uuid4().hex[:12],
-        "name": safe_name(filename) + ".rar" if not safe_name(filename).lower().endswith(".rar") else safe_name(filename),
-        "message_id": event.id,
-        "size": event.file.size,
+        "name": safe_name(filename) if safe_name(filename).lower().endswith(".rar") else safe_name(filename) + ".rar",
+        "message_id": message.id,
+        "size": document.file_size,
         "state": "queued",
         "created": int(time.time()),
     }
     save_job(job)
     queue_job(job)
-    await event.reply(
+    await message.reply_text(
         f"✅ File queued: {job['name']}\nID: {job['id']}\n"
         f"Size: {bytes_human(job['size'])}\n"
         "Safe resumable download enabled."
@@ -495,7 +494,7 @@ async def on_file(event):
 async def main():
     global worker_task
     load_jobs()
-    await client.start(bot_token=BOT_TOKEN)
+    await client.start()
     me = await client.get_me()
     log.info("Started @%s; %s storage; %d saved jobs", me.username, BASE, len(known_jobs))
     worker_task = asyncio.create_task(worker())
@@ -503,7 +502,13 @@ async def main():
     for job in sorted(known_jobs.values(), key=lambda j: j["created"]):
         if job["state"] in ("queued", "downloading", "extracting"):
             queue_job(job)
-    await client.run_until_disconnected()
+    try:
+        await idle()
+    finally:
+        worker_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker_task
+        await client.stop()
 
 
 if __name__ == "__main__":
