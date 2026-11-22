@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import fcntl
 import json
+import io
 import logging
 import os
 import re
@@ -455,8 +456,10 @@ async def lookup_private(message, raw_args):
         message_text = "\n".join(lines)
         # Split long records without silently omitting fields.
         if len(message_text) > 30000:
-            await message.reply_text("Record is extremely large. Full record remains in local SQLite; "
-                                     "Telegram preview exceeds 30,000 characters.")
+            # Telegram text messages have a size limit; deliver all fields as a private document.
+            document = io.BytesIO(message_text.encode("utf-8"))
+            document.name = f"record_{number}_page_{page}_match_{i}.txt"
+            await client.send_document(OWNER_ID, document, caption="Full matching record")
             continue
         for start in range(0, len(message_text), 3500):
             await message.reply_text(message_text[start:start+3500])
