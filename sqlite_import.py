@@ -253,6 +253,57 @@ def lookup(path, user_id, page=1, page_size=3):
     return result, len(found) > page_size
 
 
+def lookup_combined(path, user_id, scan_limit=30000):
+    """Read all indexed matching rows (bounded) and merge distinct non-empty fields.
+
+    Does not modify or deduplicate the underlying SQLite records. Source names
+    are retained, and a field with several distinct values shows every value.
+    """
+    if not user_id.isascii() or not user_id.isdecimal() or len(user_id) > 20:
+        raise ValueError("Provide a numeric Telegram User ID")
+    with connect(path, readonly=True) as db:
+        ready = db.execute("SELECT value FROM meta WHERE key='index_ready'").fetchone()
+        if not ready or ready[0] != "1":
+            raise ValueError("Index not ready; wait for /importstatus")
+        found = db.execute(
+            "SELECT s.filename, s.columns_json, r.fields_json "
+            "FROM records r JOIN sources s ON s.id=r.source_id "
+            "WHERE r.user_id=? LIMIT ?",
+            (user_id, scan_limit + 1)
+        ).fetchall()
+    truncated = len(found) > scan_limit
+    found = found[:scan_limit]
+    seen_rows = set()
+    field_values = {}
+    sources = {}
+    for filename, header_json, fields_json in found:
+        sources[filename] = sources.get(filename, 0) + 1
+        # Identical records from the same source need only be displayed once.
+        fingerprint = (filename, fields_json)
+        if fingerprint in seen_rows:
+            continue
+        seen_rows.add(fingerprint)
+        columns = json.loads(header_json)
+        values = json.loads(fields_json)
+        for i, value in enumerate(values):
+            value = str(value).strip()
+            if not value:
+                continue
+            if i < len(columns):
+                key = str(columns[i]).strip() or f"Column {i+1}"
+            else:
+                key = f"Extra column {i+1-len(columns)}"
+            normalized = key.casefold()
+            bucket = field_values.setdefault(normalized, {"name": key, "values": [],
+                                                         "seen": set()})
+            if value not in bucket["seen"]:
+                bucket["seen"].add(value)
+                bucket["values"].append(value)
+    fields = [(data["name"], data["values"]) for data in field_values.values()]
+    return {"uid": user_id, "matches": len(found), "unique_rows": len(seen_rows),
+            "sources": sources, "fields": fields, "truncated": truncated}
+
+
 def pending_job(path):
     if not Path(path).is_file():
         return None
