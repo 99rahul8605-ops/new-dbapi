@@ -14,7 +14,7 @@ An owner-only Telegram bot that downloads database archives to persistent storag
 
 ### Limitations
 
-Only **single-volume, unencrypted .rar documents**. No password RAR or multipart RAR support. A Telegram message deleted by its sender or unavailable to the bot cannot be resumed. Upload progress from your phone to Telegram is controlled by Telegram; this bot tracks **Telegram-to-VPS downloads**. The server must have stable persistent storage. Telegram/network may limit transfer speeds; `tgcrypto-pyrofork` speeds up cryptography but does not guarantee download speed. Extraction size is constrained by available disk and `MAX_EXTRACT_GB`. Resumption uses complete 1 MiB offsets and may re-fetch up to one partial chunk. It does not verify a cryptographic hash of the entire original Telegram archive.
+Supports **single-volume encrypted or unencrypted .rar documents**. Encrypted RARs need the correct owner-provided password. Multipart RARs are not supported. A Telegram message deleted by its sender or unavailable to the bot cannot be resumed. Upload progress from your phone to Telegram is controlled by Telegram; this bot tracks **Telegram-to-VPS downloads**. The server must have stable persistent storage. Telegram/network may limit transfer speeds; `tgcrypto-pyrofork` speeds up cryptography but does not guarantee download speed. Extraction size is constrained by available disk and `MAX_EXTRACT_GB`. Resumption uses complete 1 MiB offsets and may re-fetch up to one partial chunk. It does not verify a cryptographic hash of the entire original Telegram archive.
 
 This is **storage/extraction only**: it does not import SQL files, MongoDB dumps, or SQLite data into a database service.
 
@@ -70,6 +70,7 @@ tail -n 30 bot.log
 | `/pause` | Pause active download after next chunk |
 | `/resume` | Requeue all paused/failed jobs |
 | `/retry JOB_ID` | Retry one paused/failed job from saved bytes |
+| `/password JOB_ID PASSWORD` | Give password for a failed or password-locked RAR, then retry extraction without downloading again |
 
 Send a .rar document as a private Telegram message to the bot. Incoming documents queue automatically. No public upload endpoint is exposed.
 
@@ -84,3 +85,9 @@ The bot uses **Pyrofork** (a Pyrogram-compatible maintained fork) and **TgCrypto
 Wait for a currently running download to finish before stopping the previous screen session. Pull and install from the README's restart instructions afterward. To verify installed backend: `python -c 'import pyrogram; print(pyrogram.__version__)'`. The migration has not been live-tested on your VPS yet; watch `bot.log` after first start.
 
 **Safety:** Pyrofork's high-level `download_media` has had a path-traversal advisory. This project does **not** use that high-level file writer: it streams bytes directly into an internally generated filename, without trusting Telegram-provided paths.
+
+## Password-protected RAR
+
+If the archive is encrypted, the bot changes the job to `awaiting_password` and keeps its complete downloaded RAR in `.incoming`. Find the job ID with `/list`, then send `/password JOB_ID YOUR_PASSWORD` in the private bot chat. It attempts to delete that Telegram message immediately and stores the password in `DATA_DIR/.secrets/JOB_ID.password` (0600 permissions) so a restart during retry will work. It removes the file after successful extraction. **Telegram chat is not a secret vault:** deletion is best effort; avoid reusing important passwords. Telegram service, backups, or notifications may retain the original command. You may also delete `DATA_DIR/.secrets/JOB_ID.password` after use. Failed extraction retains the downloaded archive for another retry.
+
+Older initial builds removed the downloaded RAR on extraction failure; uploads failed using those versions may need to be sent again. Password is never echoed in bot progress messages.
