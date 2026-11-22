@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 
 from rar_extract import extract_archive as extract_rar_unar, ArchivePasswordError, ArchiveExtractionError
 from csv_audit import audit_folder, write_audit, summary as audit_summary
+from sqlite_import import import_job as sqlite_import_job, status as sqlite_status, lookup as sqlite_lookup, db_path as sqlite_db_path
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
@@ -71,6 +72,9 @@ pause_requested = set()
 last_progress = {}
 worker_task = None
 known_jobs = {}
+import_task = None
+import_active = None
+import_requested = set()
 
 
 def safe_name(value):
@@ -373,6 +377,9 @@ HELP = (
     "Downloads resume after restart; RAR is safely extracted when finished.\n\n"
     "/ping - test bot response\n"
     "/audit JOB_ID - recheck extracted CSV schema\n"
+    "/import JOB_ID - import extracted CSVs into private SQLite\n"
+    "/importstatus - SQLite progress and index readiness\n"
+    "/lookup USER_ID [PAGE] - view full saved fields (owner only)\n"
     "/status - current job, disk, queue\n"
     "/list - recent uploads\n"
     "/pause - pause current download\n"
@@ -380,8 +387,81 @@ HELP = (
     "/retry JOB_ID - requeue a specific failed job\n"
     "/password JOB_ID PASSWORD - unlock encrypted RAR\n"
     "/help - this help\n\n"
-    "Archives are only extracted; no database engine is modified."
+    "Private SQLite import/index runs only after /import. No public API."
 )
+
+
+def import_progress(filename, cursor):
+    # Called on import worker's thread; never contact Telegram from this thread.
+    log.info("SQLite import progress: %s row %s", filename, cursor)
+
+
+async def run_import(job_id):
+    global import_active
+    import_active = job_id
+    try:
+        await client.send_message(OWNER_ID, f"📥 SQLite import started/resumed for {job_id}. Check /importstatus.")
+        result = await asyncio.to_thread(sqlite_import_job, BASE, job_id, import_progress)
+        await client.send_message(
+            OWNER_ID, f"✅ SQLite import + User ID index completed\n"
+            f"Sources: {result['completed_sources']}/{result['sources']}\n"
+            f"Indexed rows: {result['imported']:,}\n"
+            f"Rows with invalid IDs: {result['invalid_ids']:,}\n"
+            f"Rows with inconsistent columns: {result['inconsistent_rows']:,}\n"
+            "Use /lookup USER_ID to search privately."
+        )
+    except Exception as exc:
+        log.exception("SQLite import failed for %s", job_id)
+        await client.send_message(
+            OWNER_ID, f"❌ SQLite import paused/failed for {job_id}: {type(exc).__name__}: "
+            f"{str(exc)[:240]}\nSaved progress is preserved. Use /import {job_id} to retry."
+        )
+    finally:
+        import_active = None
+        import_requested.discard(job_id)
+
+
+async def start_import(job_id):
+    global import_task
+    if import_active is not None or (import_task is not None and not import_task.done()):
+        return False
+    import_requested.add(job_id)
+    import_task = asyncio.create_task(run_import(job_id))
+    return True
+
+
+async def lookup_private(message, raw_args):
+    parts = raw_args.split()
+    if not parts:
+        await message.reply_text("Usage: /lookup USER_ID [PAGE]")
+        return
+    number = parts[0]
+    try:
+        page = int(parts[1]) if len(parts) > 1 else 1
+        result, more = await asyncio.to_thread(
+            sqlite_lookup, sqlite_db_path(BASE), number, page
+        )
+    except (ValueError, OSError, Exception) as exc:
+        await message.reply_text(f"Lookup unavailable: {str(exc)[:250]}")
+        return
+    if not result:
+        await message.reply_text("No matching record on this page.")
+        return
+    for i, (filename, pairs, extras) in enumerate(result, start=1):
+        lines = [f"🔍 User ID: {number}", f"Source: {filename}", f"Page: {page} · Match {i}"]
+        lines.extend(f"{key}: {value}" for key, value in pairs)
+        if extras:
+            lines.extend(f"extra_{j}: {v}" for j, v in enumerate(extras, start=1))
+        message_text = "\n".join(lines)
+        # Split long records without silently omitting fields.
+        if len(message_text) > 30000:
+            await message.reply_text("Record is extremely large. Full record remains in local SQLite; "
+                                     "Telegram preview exceeds 30,000 characters.")
+            continue
+        for start in range(0, len(message_text), 3500):
+            await message.reply_text(message_text[start:start+3500])
+    if more:
+        await message.reply_text(f"More matches: /lookup {number} {page+1}")
 
 
 @client.on_message(filters.all)
@@ -429,6 +509,38 @@ async def message_router(_, message):
             report = await asyncio.to_thread(audit_folder, output_path(job))
             await asyncio.to_thread(write_audit, output_path(job), report)
             await message.reply_text(audit_summary(report))
+        elif command == "/import":
+            args = (message.text or "").split(maxsplit=1)
+            jid = args[1].strip().lower() if len(args) > 1 else ""
+            folder = (BASE / jid).resolve()
+            if not re.fullmatch(r"[0-9a-f]{12}", jid) or not folder.is_dir() or folder.parent != BASE:
+                await message.reply_text("Usage: /import JOB_ID; extracted folder must exist in DATA_DIR.")
+                return
+            started = await start_import(jid)
+            await message.reply_text(
+                f"📥 Import queued for {jid}. Use /importstatus to monitor."
+                if started else f"Import already running: {import_active or 'starting'}."
+            )
+        elif command == "/importstatus":
+            info = await asyncio.to_thread(sqlite_status, sqlite_db_path(BASE))
+            if not info["exists"]:
+                await message.reply_text("No SQLite import started. Use /import JOB_ID.")
+            else:
+                current = info.get("active")
+                await message.reply_text(
+                    f"🗃 SQLite: {'INDEX READY' if info['indexed'] else 'IMPORTING / INDEXING'}\n"
+                    f"Running job: {import_active or 'none'}\n"
+                    f"Files: {info['completed_sources']}/{info['sources']}\n"
+                    f"Imported records: {info['imported']:,}\n"
+                    f"Invalid IDs: {info['invalid_ids']:,}\n"
+                    f"Inconsistent rows: {info['inconsistent_rows']:,}\n"
+                    f"DB size: {info['size_gib']} GiB\n"
+                    f"Current file: {current[1] if current else 'none'}\n"
+                    f"Current cursor: {current[2] if current else 'n/a'}"
+                )
+        elif command == "/lookup":
+            args = (message.text or "").split(maxsplit=1)
+            await lookup_private(message, args[1] if len(args) > 1 else "")
         elif command == "/pause":
             if not active_id or known_jobs[active_id]["state"] != "downloading":
                 await message.reply_text("No active download to pause.")
@@ -530,6 +642,8 @@ async def main():
     try:
         await idle()
     finally:
+        if import_task and not import_task.done():
+            log.warning('Import worker will resume from committed batches on next start')
         worker_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await worker_task
