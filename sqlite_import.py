@@ -119,6 +119,11 @@ def import_job(data_dir, job_id, progress=None):
         raise ValueError("No CSV files were found")
     with connect(database) as db:
         create_schema(db)
+        db.execute(
+            "INSERT INTO meta(key,value) VALUES('active_import_job',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (job_id,)
+        )
+        db.commit()
         # Hide incomplete imports from lookup until the index is fully ready.
         db.execute("INSERT INTO meta(key,value) VALUES('index_ready','0') "
                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
@@ -196,6 +201,7 @@ def import_job(data_dir, job_id, progress=None):
         db.execute("CREATE INDEX IF NOT EXISTS idx_records_user_id ON records(user_id)")
         db.execute("INSERT INTO meta(key,value) VALUES('index_ready','1')"
                    " ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        db.execute("DELETE FROM meta WHERE key='active_import_job'")
         db.commit()
     return status(database)
 
@@ -241,3 +247,13 @@ def lookup(path, user_id, page=1, page_size=3):
             for i, (name, v) in enumerate(zip(columns, values))
         ], values[len(columns):]))
     return result, len(found) > page_size
+
+
+def pending_job(path):
+    if not Path(path).is_file():
+        return None
+    with connect(path, readonly=True) as db:
+        row = db.execute(
+            "SELECT value FROM meta WHERE key='active_import_job'"
+        ).fetchone()
+        return row[0] if row else None
