@@ -6,6 +6,7 @@ file's complete CSV header. No deduplication or silent dropping of CSV records.
 import csv
 import json
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -253,11 +254,39 @@ def lookup(path, user_id, page=1, page_size=3):
     return result, len(found) > page_size
 
 
-def lookup_combined(path, user_id, scan_limit=30000):
-    """Read all indexed matching rows (bounded) and merge distinct non-empty fields.
+_EMAIL_RX = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.I)
+_PHONE_RX = re.compile(r"^\+?[\d\s()\-]{7,22}$")
+_USERNAME_RX = re.compile(r"^@?[A-Za-z][A-Za-z0-9_]{4,31}$")
+_NAME_LABELS = {"имя", "first name", "first_name", "firstname", "name",
+                "given name", "имя пользователя", "display name", "full name",
+                "last name", "last_name", "lastname", "surname", "фамилия"}
+_PHONE_LABELS = {"phone", "phone number", "phone_number", "mobile",
+                 "mobile number", "mobile_number", "номер телефона", "телефон"}
+_EMAIL_LABELS = {"email", "e-mail", "почта", "email address", "email_address"}
+_USERNAME_LABELS = {"username", "user name", "user_name", "telegram username",
+                    "telegram_username", "никнейм"}
+_ID_LABELS = {"telegram id", "user id", "user_id", "account_id", "id",
+              "telegram_id"}
 
-    Does not modify or deduplicate the underlying SQLite records. Source names
-    are retained, and a field with several distinct values shows every value.
+
+def _field_kind(value):
+    """Classify only unmistakable value shapes; never assume ambiguous words."""
+    if _EMAIL_RX.fullmatch(value):
+        return "email"
+    stripped = re.sub(r"[\s()\-]", "", value)
+    if (_PHONE_RX.fullmatch(value) and stripped.lstrip("+").isascii()
+            and stripped.lstrip("+").isdecimal()
+            and 10 <= len(stripped.lstrip("+")) <= 15):
+        return "phone"
+    return None
+
+
+def lookup_combined(path, user_id, scan_limit=30000):
+    """Safely aggregate a UID's values without attributing shifted CSV cells.
+
+    CSV columns with inconsistent widths are not trusted for unvalidated fields.
+    Contacts are classified by recognizable value format, while names/usernames
+    are accepted only from structurally consistent rows with matching headers.
     """
     if not user_id.isascii() or not user_id.isdecimal() or len(user_id) > 20:
         raise ValueError("Provide a numeric Telegram User ID")
@@ -266,42 +295,97 @@ def lookup_combined(path, user_id, scan_limit=30000):
         if not ready or ready[0] != "1":
             raise ValueError("Index not ready; wait for /importstatus")
         found = db.execute(
-            "SELECT s.filename, s.columns_json, r.fields_json "
+            "SELECT s.filename,s.columns_json,r.fields_json "
             "FROM records r JOIN sources s ON s.id=r.source_id "
             "WHERE r.user_id=? LIMIT ?",
             (user_id, scan_limit + 1)
         ).fetchall()
+
     truncated = len(found) > scan_limit
     found = found[:scan_limit]
-    seen_rows = set()
-    field_values = {}
+    unique_rows = set()
     sources = {}
+    mismatched = 0
+    values = {"Name": [], "Surname": [], "Username": [],
+              "Phone": [], "Email": [], "Other labeled fields": []}
+    seen = {key: set() for key in values}
+    unverified_count = 0
+
+    def add(key, value, source=None):
+        item = (value, source) if source else value
+        if item not in seen[key]:
+            seen[key].add(item)
+            values[key].append(item)
+
     for filename, header_json, fields_json in found:
         sources[filename] = sources.get(filename, 0) + 1
-        # Identical records from the same source need only be displayed once.
-        fingerprint = (filename, fields_json)
-        if fingerprint in seen_rows:
+        identity = (filename, fields_json)
+        if identity in unique_rows:
             continue
-        seen_rows.add(fingerprint)
-        columns = json.loads(header_json)
-        values = json.loads(fields_json)
-        for i, value in enumerate(values):
-            value = str(value).strip()
-            if not value:
+        unique_rows.add(identity)
+        headers = json.loads(header_json)
+        fields = json.loads(fields_json)
+        consistent = len(headers) == len(fields)
+        if not consistent:
+            mismatched += 1
+        for index, original_value in enumerate(fields):
+            value = str(original_value).strip()
+            if not value or value == user_id:
                 continue
-            if i < len(columns):
-                key = str(columns[i]).strip() or f"Column {i+1}"
+            header = (str(headers[index]).strip() if index < len(headers) else "")
+            label = header.casefold()
+            kind = _field_kind(value)
+
+            # Contacts are recognizable by their contents even if column
+            # labels were shifted due to missing CSV separators.
+            if kind == "email":
+                add("Email", value)
+                continue
+            if kind == "phone":
+                # Reject user ID and arbitrary numeric fields from bad rows:
+                # phone must appear in a phone/contact/name/email field.
+                if (label in _PHONE_LABELS or label in _EMAIL_LABELS
+                        or label in _NAME_LABELS or label in _USERNAME_LABELS):
+                    add("Phone", value)
+                else:
+                    unverified_count += 1
+                continue
+
+            if label in _ID_LABELS:
+                continue
+            if not consistent:
+                # On misaligned rows non-contact fields cannot be reliably
+                # assigned their original header names.
+                unverified_count += 1
+                continue
+            if label in _USERNAME_LABELS:
+                # Telegram usernames are ASCII, 5–32 chars, not display names.
+                if _USERNAME_RX.fullmatch(value):
+                    add("Username", value.lstrip("@"))
+                else:
+                    unverified_count += 1
+            elif label in {"имя", "first name", "first_name", "firstname",
+                           "name", "given name", "display name", "full name"}:
+                add("Name", value)
+            elif label in {"фамилия", "last name", "last_name", "lastname", "surname"}:
+                add("Surname", value)
+            elif label in _EMAIL_LABELS or label in _PHONE_LABELS:
+                unverified_count += 1
+            elif header and "\ufffd" not in header and len(header) <= 100:
+                add("Other labeled fields", value, header)
             else:
-                key = f"Extra column {i+1-len(columns)}"
-            normalized = key.casefold()
-            bucket = field_values.setdefault(normalized, {"name": key, "values": [],
-                                                         "seen": set()})
-            if value not in bucket["seen"]:
-                bucket["seen"].add(value)
-                bucket["values"].append(value)
-    fields = [(data["name"], data["values"]) for data in field_values.values()]
-    return {"uid": user_id, "matches": len(found), "unique_rows": len(seen_rows),
-            "sources": sources, "fields": fields, "truncated": truncated}
+                unverified_count += 1
+
+    ordered = []
+    for key in ("Name", "Surname", "Username", "Phone", "Email"):
+        if values[key]:
+            ordered.append((key, values[key]))
+    if values["Other labeled fields"]:
+        ordered.append(("Other labeled fields", values["Other labeled fields"]))
+
+    return {"uid": user_id, "matches": len(found), "unique_rows": len(unique_rows),
+            "sources": sources, "fields": ordered, "truncated": truncated,
+            "mismatched": mismatched, "unverified_count": unverified_count}
 
 
 def pending_job(path):
