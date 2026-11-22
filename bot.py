@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 
 from rar_extract import extract_archive as extract_rar_unar, ArchivePasswordError, ArchiveExtractionError
+from csv_audit import audit_folder, write_audit, summary as audit_summary
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
@@ -289,6 +290,20 @@ async def process_job(job):
             f"Files: {count} · Unpacked: {bytes_human(size)}\n"
             f"Server folder: {output_path(job)}", job
         )
+        try:
+            report = await asyncio.to_thread(audit_folder, output_path(job))
+            await asyncio.to_thread(write_audit, output_path(job), report)
+            job["csv_audit"] = {
+                "csv_count": report["csv_count"],
+                "numeric_id_samples": report["numeric_id_samples"],
+                "total_samples": report["total_samples"],
+            }
+            save_job(job)
+            await client.send_message(OWNER_ID, audit_summary(report))
+        except Exception:
+            log.exception("CSV audit failed for %s (extraction is still complete)", job["id"])
+            await client.send_message(OWNER_ID, "⚠️ CSV audit failed; extracted files are safe. Use /audit " + job["id"])
+
     except InterruptedError:
         job["state"] = "paused"
         save_job(job)
@@ -357,6 +372,7 @@ HELP = (
     "Send a single .rar document in this private chat.\n"
     "Downloads resume after restart; RAR is safely extracted when finished.\n\n"
     "/ping - test bot response\n"
+    "/audit JOB_ID - recheck extracted CSV schema\n"
     "/status - current job, disk, queue\n"
     "/list - recent uploads\n"
     "/pause - pause current download\n"
@@ -402,6 +418,17 @@ async def message_router(_, message):
             jobs = sorted(known_jobs.values(), key=lambda j: j["created"], reverse=True)[:10]
             await message.reply_text("\n\n".join(job_status(j) for j in jobs)
                                      if jobs else "No uploads yet.")
+        elif command == "/audit":
+            args = (message.text or "").split(maxsplit=1)
+            jid = args[1].strip().lower() if len(args) > 1 else ""
+            job = known_jobs.get(jid)
+            if not job or job.get("state") != "done" or not output_path(job).is_dir():
+                await message.reply_text("Usage: /audit JOB_ID for a completed extraction. Use /list.")
+                return
+            await message.reply_text("🔎 Checking CSV schema and sample quality...")
+            report = await asyncio.to_thread(audit_folder, output_path(job))
+            await asyncio.to_thread(write_audit, output_path(job), report)
+            await message.reply_text(audit_summary(report))
         elif command == "/pause":
             if not active_id or known_jobs[active_id]["state"] != "downloading":
                 await message.reply_text("No active download to pause.")
