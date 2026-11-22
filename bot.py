@@ -192,16 +192,36 @@ async def receive_archive(event):
         temp = BASE_DIR / ".incoming" / f"{job}_{archive_name}"
         target = BASE_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{job}_{archive_name[:-4]}"
         msg = await event.reply("⬇️ Downloading RAR from Telegram...")
+        started_at = time.monotonic()
         last_update = [0.0]
+        last_sample = [started_at, 0]
+        speed_mbps = [0.0]
 
         async def progress(current, total):
             now = time.monotonic()
+            elapsed = max(now - last_sample[0], 0.001)
+            if elapsed >= 2:
+                sample_speed = max(0, current - last_sample[1]) / elapsed / 1024**2
+                speed_mbps[0] = (
+                    sample_speed if speed_mbps[0] == 0
+                    else 0.6 * speed_mbps[0] + 0.4 * sample_speed
+                )
+                last_sample[:] = [now, current]
             if now - last_update[0] < 8 and current < total:
                 return
             last_update[0] = now
             percent = current * 100 / total if total else 0
+            avg_speed = current / max(now - started_at, 0.001) / 1024**2
+            speed = speed_mbps[0] or avg_speed
+            eta = (total - current) / (speed * 1024**2) if speed > 0 and total else 0
+            eta_text = f"{int(eta // 60)}m {int(eta % 60)}s" if eta else "calculating"
             try:
-                await msg.edit(f"⬇️ Downloading: {percent:.1f}% ({current / 1024**2:.1f} MiB)")
+                await msg.edit(
+                    f"⬇️ Downloading: {percent:.1f}%\n"
+                    f"Received: {current / 1024**2:.1f} / {total / 1024**2:.1f} MiB\n"
+                    f"Speed: {speed:.2f} MiB/s\n"
+                    f"ETA: {eta_text}"
+                )
             except Exception:
                 pass
 
