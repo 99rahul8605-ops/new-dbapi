@@ -13,7 +13,7 @@ import time
 import uuid
 from pathlib import Path, PurePosixPath
 
-import rarfile
+from rar_extract import extract_archive as extract_rar_unar, ArchivePasswordError, ArchiveExtractionError
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
 
@@ -156,81 +156,9 @@ def get_password(job):
     return file.read_text(encoding="utf-8") if file.exists() else None
 
 
-def validate_entry(info):
-    raw = info.filename.replace("\\", "/")
-    path = PurePosixPath(raw)
-    if not raw or raw.startswith("/") or re.match(r"^[A-Za-z]:", raw):
-        raise ValueError("Unsafe absolute path")
-    if any(part in ("", ".", "..") for part in raw.rstrip("/").split("/")):
-        raise ValueError("Unsafe archive path")
-    if len(path.parts) > 30 or len(raw) > 1000:
-        raise ValueError("Archive path too long")
-    if getattr(info, "is_symlink", lambda: False)():
-        raise ValueError("Symbolic links are not allowed")
-    mode = getattr(info, "mode", 0) or 0
-    if stat.S_IFMT(mode) not in (0, stat.S_IFREG, stat.S_IFDIR):
-        raise ValueError("Special archive entries are not allowed")
-    return path
-
-
 def extract_archive(source, destination, password=None):
-    """Extract into disposable staging dir, only publish completed directories."""
-    stage = BASE / (".extracting_" + destination.name)
-    if destination.exists():
-        raise ValueError("Destination already exists")
-    shutil.rmtree(stage, ignore_errors=True)
-    stage.mkdir()
-    try:
-        with rarfile.RarFile(str(source)) as archive:
-            if password is not None:
-                archive.setpassword(password)
-            elif archive.needs_password():
-                raise ValueError("PASSWORD_REQUIRED")
-            entries = archive.infolist()
-            if len(entries) > MAX_FILES:
-                raise ValueError("Too many archive entries")
-            total = 0
-            seen = set()
-            for entry in entries:
-                rel = validate_entry(entry)
-                key = str(rel).casefold()
-                if key in seen:
-                    raise ValueError("Duplicate archive entries")
-                seen.add(key)
-                if not entry.isdir():
-                    total += entry.file_size
-                    if total > MAX_BYTES:
-                        raise ValueError(f"Extracted size exceeds {MAX_GB:g} GiB")
-            if shutil.disk_usage(BASE).free < total + 128 * 1024**2:
-                raise ValueError("Not enough free disk space for extraction")
-            actual = 0
-            count = 0
-            for entry in entries:
-                rel = validate_entry(entry)
-                dest = stage.joinpath(*rel.parts)
-                if entry.isdir():
-                    dest.mkdir(parents=True, exist_ok=True)
-                    continue
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                written = 0
-                with archive.open(entry) as src, dest.open("xb") as dst:
-                    while True:
-                        data = src.read(1024 * 1024)
-                        if not data:
-                            break
-                        written += len(data)
-                        actual += len(data)
-                        if written > entry.file_size or actual > MAX_BYTES:
-                            raise ValueError("RAR content exceeds declared size")
-                        dst.write(data)
-                if written != entry.file_size:
-                    raise ValueError("RAR content length mismatch")
-                count += 1
-        os.replace(stage, destination)
-        return count, actual
-    except BaseException:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
+    """Use the same unar backend verified manually on this server."""
+    return extract_rar_unar(source, destination, password, MAX_FILES, MAX_BYTES)
 
 
 async def send_notice(text, job=None):
@@ -369,14 +297,10 @@ async def process_job(job):
         log.error("Job %s failed (%s)", job["id"], type(exc).__name__)
         job["state"] = "failed"
         error_text = str(exc)
-        if "PASSWORD_REQUIRED" in error_text or isinstance(exc, rarfile.PasswordRequired):
+        if isinstance(exc, ArchivePasswordError):
             job["state"] = "awaiting_password"
-            job["error"] = "Password required"
-            guidance = f"🔐 Archive needs a password. Use /password {job['id']} YOUR_PASSWORD."
-        elif get_password(job) is not None and isinstance(exc, (rarfile.BadRarFile, rarfile.RarExecError)):
-            job["state"] = "awaiting_password"
-            job["error"] = "Decryption failed; check archive password"
-            guidance = f"🔐 Check the password. Use /password {job['id']} CORRECT_PASSWORD."
+            job["error"] = "Password required or incorrect"
+            guidance = f"🔐 Archive password needed. Use /password {job['id']} CORRECT_PASSWORD."
         else:
             job["error"] = error_text[:350]
             guidance = f"❌ Failed {job['id']}: {job['error']}\nUse /retry {job['id']}."
