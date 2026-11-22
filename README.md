@@ -105,3 +105,27 @@ For an already-downloaded failed archive, keep `DATA_DIR` unchanged and use `/re
 After each successful RAR extraction the bot automatically samples up to 1,000 data rows per `.csv` file. It detects per-file delimiter (comma, semicolon, pipe, tab), maps candidate ID headers (`Telegram ID`, `User ID`, `User_ID`, `account_id`, `id`), counts numeric ID values, and reports inconsistent sampled row widths. Results go to `DATA_DIR/JOB_ID/_csv_audit.json`, containing aggregate counts and column metadata, **not personal data rows**. The bot sends a brief summary to the owner. Use `/audit JOB_ID` to rerun the same check on an already completed extraction; extraction and audit are separate, so audit failure does not invalidate extraction. This is a sampling step, not a full-file integrity scan or database import. No SQLite tables or per-user search indices are created by this feature.
 
 **Processing checklist for future phases:** archive reception → resumable download → safe extraction → automatic CSV format/schema audit → aggregate validation report → only after data authorization, design suitable data storage/import and optional indexing. Original archives and CSVs should not be overwritten as part of auditing.
+
+## Private SQLite importer and User ID index
+
+The owner can import extracted CSVs into a private SQLite database, using the **complete original CSV row**, including all source columns and duplicate IDs. The SQLite DB lives at `DATA_DIR/.private_index/records.sqlite3`. It is not exposed through any HTTP API.
+
+- `/import JOB_ID` starts the streaming import for extracted job folder `DATA_DIR/JOB_ID`. Legacy manually extracted folders at `DATA_DIR/../JOB_ID` are also supported, so you do not have to move 24 GB of files.
+- `/importstatus` reports completed files, row count, invalid ID count, inconsistent column count, indexed/not-indexed state and DB size.
+- `/lookup USER_ID` privately shows up to three matching records at a time, preserving source column names and field values; use `/lookup USER_ID 2` for the next page. Very long records are sent as a private text document.
+- Index creation runs after initial import finishes. Lookup will not claim readiness until index creation completes.
+- Every 10,000 parsed CSV records are committed with a stored cursor. After a bot reboot, the job resumes from committed progress. A crashed import skips previously processed rows, so resuming a very large CSV may take time but does not duplicate committed records.
+- CSV files are read-only. No data is automatically deleted, deduplicated or overwritten.
+- Only the configured Telegram owner is authorized; keep the bot token, owner account and VPS secure. Telegram chats are not a substitute for encrypted-at-rest storage.
+- Data is imported only on explicit `/import`, not automatically from the archive upload. Each CSV's own delimiter and ID column are detected independently.
+
+### To import your previously manually extracted archive
+
+After deploying the latest bot, send:
+
+```text
+/import ac7e843a2ac2
+/importstatus
+```
+
+Wait until `INDEX READY`, then `/lookup 123456789` (replace with an ID you are authorized to view). The bot should find the already extracted files in `/new-dbapi/ac7e843a2ac2` if `DATA_DIR=/new-dbapi/database_uploads`. The full dataset may take considerable CPU and disk I/O time to process. Check disk space before starting. The CSV text decoder uses replacement for invalid UTF-8 bytes; originals remain unchanged for recovery or reimport if the encoding needs refinement.
