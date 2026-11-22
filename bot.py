@@ -54,6 +54,14 @@ try:
 except BlockingIOError:
     raise SystemExit("Another uploader already uses this DATA_DIR")
 
+# Pyrofork captures the event loop when the Client is created.
+# Keep this loop for Client.run(main()); asyncio.run(main()) would create a
+# different loop and silently break incoming update handlers.
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 client = Client("upload_bot_pyrofork_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workers=8)
 queue = asyncio.Queue()
 queued_ids = set()
@@ -579,6 +587,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        # Use the same loop as the module-level Client and job queue.
+        client.run(main())
     except KeyboardInterrupt:
         pass
