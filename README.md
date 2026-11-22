@@ -9,7 +9,7 @@ An owner-only Telegram bot that downloads database archives to persistent storag
 - Sequential queue so multiple incoming RAR files don't download simultaneously; queued jobs survive restart.
 - Telegram progress message displays percentage, downloaded MiB, current MiB/s and ETA. Telegram edits are throttled to avoid flood limits.
 - Owner-only private chat. One instance per storage folder. `/pause`, `/resume`, `/retry`, `/status`, `/list`.
-- Safe extraction into a staging directory; path traversal and special file entries rejected, with file-count/size and free-space limits.
+- Safe extraction using system `unar` and `lsar` into a staging directory; archive listing checks paths, file-count/size and available disk before extraction.
 - On successful extraction removes the downloaded archive unless `KEEP_RAR=true`. Failed extraction **retains** the archive for retry.
 
 ### Limitations
@@ -88,6 +88,14 @@ Wait for a currently running download to finish before stopping the previous scr
 
 ## Password-protected RAR
 
-If the archive is encrypted, the bot changes the job to `awaiting_password` and keeps its complete downloaded RAR in `.incoming`. Find the job ID with `/list`, then send `/password JOB_ID YOUR_PASSWORD` in the private bot chat. It attempts to delete that Telegram message immediately and stores the password in `DATA_DIR/.secrets/JOB_ID.password` (0600 permissions) so a restart during retry will work. It removes the file after successful extraction. **Telegram chat is not a secret vault:** deletion is best effort; avoid reusing important passwords. Telegram service, backups, or notifications may retain the original command. You may also delete `DATA_DIR/.secrets/JOB_ID.password` after use. Failed extraction retains the downloaded archive for another retry.
+If the archive is encrypted or password is wrong, the bot changes the job to `awaiting_password` and keeps its complete downloaded RAR in `.incoming`. Find the job ID with `/list`, then send `/password JOB_ID YOUR_PASSWORD` in the private bot chat. It attempts to delete that Telegram message immediately and stores the password in `DATA_DIR/.secrets/JOB_ID.password` (0600 permissions) so a restart during retry will work. It removes the file after successful extraction. **Telegram chat is not a secret vault:** deletion is best effort; avoid reusing important passwords. Telegram service, backups, or notifications may retain the original command. You may also delete `DATA_DIR/.secrets/JOB_ID.password` after use. Failed extraction retains the downloaded archive for another retry.
 
 Older initial builds removed the downloaded RAR on extraction failure; uploads failed using those versions may need to be sent again. Password is never echoed in bot progress messages.
+
+## Extraction fix (2026-11-22)
+
+The Python `rarfile` stream extractor was replaced by the same `unar` executable used by the server's successful manual test. `lsar -json` validates paths, file count and uncompressed size first. `unar` extracts to a private staging directory; only a successful extraction is moved to `DATA_DIR/JOB_ID`. On failure the complete `.incoming/JOB_ID.part` is retained. Install `unar` (includes `lsar`) with `apt install -y unar`.
+
+For an already-downloaded failed archive, keep `DATA_DIR` unchanged and use `/retry JOB_ID` after upgrading. If the job is waiting for a password, send `/password JOB_ID ACTUAL_PASSWORD` instead. No 3.5 GiB re-download should be required when the saved partial file is complete.
+
+**Password privacy caveat:** The `unar` and `lsar` CLI interfaces accept password options as command arguments. A sufficiently privileged local OS user may briefly see them in process listings; use a dedicated single-user VPS, restrict other accounts, and use passwords that are not reused elsewhere. The bot never prints the password to its own logs.
