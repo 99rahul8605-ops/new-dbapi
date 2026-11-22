@@ -513,8 +513,12 @@ async def message_router(_, message):
             args = (message.text or "").split(maxsplit=1)
             jid = args[1].strip().lower() if len(args) > 1 else ""
             folder = (BASE / jid).resolve()
-            if not re.fullmatch(r"[0-9a-f]{12}", jid) or not folder.is_dir() or folder.parent != BASE:
-                await message.reply_text("Usage: /import JOB_ID; extracted folder must exist in DATA_DIR.")
+            if not folder.is_dir():
+                folder = (BASE.parent / jid).resolve()
+            if (not re.fullmatch(r"[0-9a-f]{12}", jid)
+                    or not folder.is_dir()
+                    or folder.parent not in (BASE, BASE.parent)):
+                await message.reply_text("Usage: /import JOB_ID; extracted folder must exist in DATA_DIR or repository folder.")
                 return
             started = await start_import(jid)
             await message.reply_text(
