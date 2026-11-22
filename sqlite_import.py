@@ -257,3 +257,97 @@ def pending_job(path):
             "SELECT value FROM meta WHERE key='active_import_job'"
         ).fetchone()
         return row[0] if row else None
+
+
+def _username_position(headers):
+    for index, header in enumerate(headers):
+        normalized = str(header).strip().casefold().replace("_", " ").replace("-", " ")
+        if normalized in ("username", "user name", "никнейм"):
+            return index
+    return None
+
+
+def username_index_status(path):
+    if not Path(path).is_file():
+        return {"ready": False, "cursor": 0, "entries": 0}
+    with connect(path, readonly=True) as db:
+        ready = db.execute("SELECT value FROM meta WHERE key='username_index_ready'").fetchone()
+        cursor = db.execute("SELECT value FROM meta WHERE key='username_index_cursor'").fetchone()
+        table = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='usernames'").fetchone()
+        total = db.execute("SELECT COUNT(*) FROM usernames").fetchone()[0] if table else 0
+    return {"ready": bool(ready and ready[0] == '1'), "cursor": int(cursor[0]) if cursor else 0, "entries": total}
+
+
+def build_username_index(path, progress=None):
+    """Build/resume index from existing SQLite rows, without rereading original CSVs."""
+    path = Path(path)
+    if not path.is_file():
+        raise ValueError("SQLite DB not found. Run /import first")
+    with connect(path) as db:
+        db.execute("CREATE TABLE IF NOT EXISTS usernames (record_rowid INTEGER PRIMARY KEY, username_norm TEXT NOT NULL)")
+        db.execute("INSERT INTO meta(key,value) VALUES('username_index_ready','0') "
+                   "ON CONFLICT(key) DO UPDATE SET value='0'")
+        db.commit()
+        row = db.execute("SELECT value FROM meta WHERE key='username_index_cursor'").fetchone()
+        cursor = int(row[0]) if row else 0
+        headers_by_id = {}
+        for sid, header_json in db.execute("SELECT id, columns_json FROM sources"):
+            headers_by_id[sid] = _username_position(json.loads(header_json))
+        while True:
+            rows = db.execute(
+                "SELECT rowid,source_id,fields_json FROM records "
+                "WHERE rowid > ? ORDER BY rowid LIMIT 10000", (cursor,)
+            ).fetchall()
+            if not rows:
+                break
+            matches = []
+            for rowid, source_id, fields in rows:
+                pos = headers_by_id.get(source_id)
+                if pos is None:
+                    continue
+                values = json.loads(fields)
+                if pos >= len(values):
+                    continue
+                username = str(values[pos]).strip().lstrip("@").casefold()
+                if username and len(username) <= 64 and not any(ch.isspace() for ch in username):
+                    matches.append((rowid, username))
+            cursor = rows[-1][0]
+            with db:
+                db.executemany("INSERT OR REPLACE INTO usernames(record_rowid,username_norm) VALUES (?,?)", matches)
+                db.execute("INSERT INTO meta(key,value) VALUES('username_index_cursor',?) "
+                           "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cursor),))
+            if progress:
+                progress(cursor)
+        db.execute("CREATE INDEX IF NOT EXISTS idx_usernames_norm ON usernames(username_norm)")
+        db.execute("INSERT INTO meta(key,value) VALUES('username_index_ready','1') "
+                   "ON CONFLICT(key) DO UPDATE SET value='1'")
+        db.commit()
+    return username_index_status(path)
+
+
+def lookup_username(path, username, page=1, page_size=3):
+    username = username.strip().lstrip("@").casefold()
+    if not username or len(username) > 64 or any(ch.isspace() for ch in username):
+        raise ValueError("Provide a valid username")
+    if not 1 <= page <= 10000:
+        raise ValueError("Invalid page number")
+    with connect(path, readonly=True) as db:
+        indexed = db.execute("SELECT value FROM meta WHERE key='username_index_ready'").fetchone()
+        if not indexed or indexed[0] != '1':
+            raise ValueError("Username index not ready. Use /usernameindex")
+        rows = db.execute(
+            "SELECT s.filename,s.columns_json,r.fields_json,r.user_id "
+            "FROM usernames u JOIN records r ON r.rowid=u.record_rowid "
+            "JOIN sources s ON s.id=r.source_id "
+            "WHERE u.username_norm=? ORDER BY u.record_rowid LIMIT ? OFFSET ?",
+            (username,page_size+1,(page-1)*page_size)
+        ).fetchall()
+    results = []
+    for filename, headers_json, fields_json, uid in rows[:page_size]:
+        columns = json.loads(headers_json)
+        values = json.loads(fields_json)
+        pairs = [(name if str(name).strip() else f"column_{i+1}", value)
+                 for i,(name,value) in enumerate(zip(columns,values)) if str(value).strip()]
+        pairs.extend((f"extra_{i+1}",value) for i,value in enumerate(values[len(columns):]) if str(value).strip())
+        results.append((filename, uid, pairs))
+    return results, len(rows)>page_size
