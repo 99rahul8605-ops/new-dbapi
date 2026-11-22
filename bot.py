@@ -380,7 +380,7 @@ HELP = (
     "/ping - test bot response\n"
     "/audit JOB_ID - recheck extracted CSV schema\n"
     "/import JOB_ID - import extracted CSVs into private SQLite\n"
-    "/importstatus - SQLite progress and index readiness\n"
+    "/importstatus - live CSV/index progress, CPU, RAM and disk I/O\n"
     "/lookup USER_ID [PAGE] - view full saved fields (owner only)\n"
     "/usernameindex - build/resume username index after import\n"
     "/user USERNAME [PAGE] - private username lookup\n"
@@ -393,6 +393,140 @@ HELP = (
     "/help - this help\n\n"
     "Private SQLite import/index runs only after /import. No public API."
 )
+
+
+def _human_bytes(n):
+    if n is None:
+        return "unavailable"
+    n = float(n)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(n) < 1024 or unit == "TiB":
+            return f"{n:.2f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1024
+
+
+def _proc_io_bytes():
+    """Linux per-process disk I/O counters, not file-system cache traffic."""
+    with open("/proc/self/io", encoding="ascii") as fh:
+        values = {}
+        for line in fh:
+            key, sep, value = line.partition(":")
+            if sep:
+                values[key.strip()] = int(value.strip())
+    return values.get("read_bytes", 0), values.get("write_bytes", 0)
+
+
+def _proc_rss_bytes():
+    with open("/proc/self/status", encoding="ascii") as fh:
+        for line in fh:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024
+    return None
+
+
+def _sqlite_extra_sizes(path):
+    result = {}
+    for suffix, name in (("", "DB"), ("-wal", "WAL"), ("-shm", "SHM")):
+        try:
+            result[name] = Path(str(path) + suffix).stat().st_size
+        except OSError:
+            result[name] = 0
+    return result
+
+
+def _io_sample(seconds=1.5):
+    """Run in a worker thread to avoid blocking the Telegram event loop."""
+    t1 = time.monotonic()
+    proc_start = os.times()
+    try:
+        r1, w1 = _proc_io_bytes()
+        time.sleep(seconds)
+        r2, w2 = _proc_io_bytes()
+        elapsed = max(time.monotonic() - t1, 0.01)
+        proc_end = os.times()
+        cpu_used = ((proc_end.user + proc_end.system) -
+                    (proc_start.user + proc_start.system))
+        return {"read": max(0, r2-r1) / elapsed,
+                "write": max(0, w2-w1) / elapsed,
+                "cpu": max(0.0, cpu_used / elapsed * 100.0),
+                "rss": _proc_rss_bytes()}
+    except (OSError, ValueError):
+        return None
+
+
+def _csv_file_count(job_id):
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id or ""):
+        return None
+    for root in (BASE / job_id, BASE.parent / job_id):
+        if root.is_dir():
+            return sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() == ".csv")
+    return None
+
+
+def _read_import_stats():
+    """Collect low-cost SQLite and OS stats from the worker thread."""
+    path = sqlite_db_path(BASE)
+    info = sqlite_status(path)
+    sizes = _sqlite_extra_sizes(path)
+    disk = shutil.disk_usage(BASE)
+    job_id = import_active or sqlite_pending_job(path)
+    total_files = _csv_file_count(job_id) if job_id else None
+    return info, sizes, disk.free, disk.total, job_id, total_files
+
+
+async def import_status_text():
+    info, sizes, free, total, job_id, total_files = await asyncio.to_thread(_read_import_stats)
+    if not info.get("exists"):
+        return "No SQLite import started. Use /import JOB_ID."
+
+    active = info.get("active")
+    registered = info["sources"]
+    completed = info["completed_sources"]
+    expected = max(registered, total_files) if total_files is not None else registered
+    running = bool(import_task and not import_task.done())
+
+    if info["indexed"]:
+        phase = "✅ USER ID INDEX READY"
+    elif job_id and completed >= expected and expected > 0 and active is None:
+        phase = "🔨 BUILDING USER ID INDEX" if running else "⏸ Index pending / paused"
+    elif running:
+        phase = "📥 IMPORTING CSV"
+    else:
+        phase = "⏸ Import not currently active"
+
+    lines = [
+        f"🗃 SQLite: {phase}",
+        f"Job: {job_id or 'none'}",
+        f"CSV files: {completed}/{expected}" +
+        (f" ({registered} registered)" if expected != registered else ""),
+        f"Imported records: {info['imported']:,}",
+        f"Invalid IDs: {info['invalid_ids']:,}",
+        f"Inconsistent rows: {info['inconsistent_rows']:,}",
+        f"Database: {_human_bytes(sizes['DB'])}",
+        f"WAL / SHM: {_human_bytes(sizes['WAL'])} / {_human_bytes(sizes['SHM'])}",
+        f"Free disk: {_human_bytes(free)} / {_human_bytes(total)}",
+    ]
+    if active:
+        lines += [f"Current CSV: {active[1]}",
+                  f"CSV rows scanned: {active[2]:,}"]
+    elif not info["indexed"] and completed == expected and expected:
+        lines.append("Current step: creating SQLite User ID index")
+    lines.append(f"Bot PID: {os.getpid()}")
+
+    sample = await asyncio.to_thread(_io_sample)
+    if sample is None:
+        lines.append("Bot disk I/O: unavailable (Linux /proc required)")
+    else:
+        lines += [
+            f"Bot CPU usage: {sample['cpu']:.1f}% (sampled)",
+            f"Bot RAM (RSS): {_human_bytes(sample['rss'])}",
+            f"Bot disk READ: {_human_bytes(sample['read'])}/s",
+            f"Bot disk WRITE: {_human_bytes(sample['write'])}/s",
+        ]
+    lines.append("I/O rates are for the entire bot process, sampled over ~1.5 sec.")
+    if not info["indexed"]:
+        lines.append("Lookup becomes available once User ID index is ready.")
+    return "\n".join(lines)
 
 
 def import_progress(filename, cursor):
@@ -578,22 +712,7 @@ async def message_router(_, message):
                 if started else f"Import already running: {import_active or 'starting'}."
             )
         elif command == "/importstatus":
-            info = await asyncio.to_thread(sqlite_status, sqlite_db_path(BASE))
-            if not info["exists"]:
-                await message.reply_text("No SQLite import started. Use /import JOB_ID.")
-            else:
-                current = info.get("active")
-                await message.reply_text(
-                    f"🗃 SQLite: {'INDEX READY' if info['indexed'] else 'IMPORTING / INDEXING'}\n"
-                    f"Running job: {import_active or 'none'}\n"
-                    f"Files: {info['completed_sources']}/{info['sources']}\n"
-                    f"Imported records: {info['imported']:,}\n"
-                    f"Invalid IDs: {info['invalid_ids']:,}\n"
-                    f"Inconsistent rows: {info['inconsistent_rows']:,}\n"
-                    f"DB size: {info['size_gib']} GiB\n"
-                    f"Current file: {current[1] if current else 'none'}\n"
-                    f"Current cursor: {current[2] if current else 'n/a'}"
-                )
+            await message.reply_text(await import_status_text())
         elif command == "/lookup":
             args = (message.text or "").split(maxsplit=1)
             await lookup_private(message, args[1] if len(args) > 1 else "")
